@@ -1,2 +1,2 @@
-# speech-command-ai
-This repository will store project for speech recognition commands
+# mjusic-ai
+This repository will store project for Music related AI processing
