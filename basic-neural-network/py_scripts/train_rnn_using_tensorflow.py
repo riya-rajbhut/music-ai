@@ -10,8 +10,6 @@ SEED = 53
 tf.random.set_seed(SEED)
 np.random.seed(SEED)
 
-SAMPLING_RATE = 16000   #I am feeding music as 16k per second
-
 print(f"\n TensorFlow Version: {tf.__version__}")
 print(f"\n GPUs Available: {tf.config.list_physical_devices('GPU')}")
 
