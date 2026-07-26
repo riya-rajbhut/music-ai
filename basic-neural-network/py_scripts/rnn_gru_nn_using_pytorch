@@ -106,7 +106,7 @@ print(f"Flattened Array Shape: {all_notes_flat.shape}")
 if not cache_file.exists():
     np.save(cache_file, all_notes_flat)
 
-class BasicRNNForMusic(data.Dataset):
+class GruMusicDataset(data.Dataset):
     def __init__(self, notes_array, seq_len=30):
         self.seq_len = seq_len
 
@@ -149,9 +149,9 @@ train_notes = all_notes_flat[:train_cutoff]
 val_notes = all_notes_flat[train_cutoff:val_cutoff]
 test_notes = all_notes_flat[val_cutoff:]
 
-training_dataset = BasicRNNForMusic(train_notes, seq_len=seq_len)
-validation_dataset = BasicRNNForMusic(val_notes, seq_len=seq_len)
-testing_dataset = BasicRNNForMusic(test_notes, seq_len=seq_len)
+training_dataset = GruMusicDataset(train_notes, seq_len=seq_len)
+validation_dataset = GruMusicDataset(val_notes, seq_len=seq_len)
+testing_dataset = GruMusicDataset(test_notes, seq_len=seq_len)
 print(f"Training Dataset Length: {len(training_dataset)}, Validation Dataset Length: {len(validation_dataset)}, Testing Dataset Length: {len(testing_dataset)}")
 
 training_loader = data.DataLoader(training_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
@@ -160,9 +160,9 @@ testing_loader = data.DataLoader(testing_dataset, batch_size=batch_size, shuffle
 import torch
 import torch.nn as nn
 
-class MusicRNNV2(nn.Module):
+class MusicGruNN(nn.Module):
     def __init__(self, num_pitches=128, pitch_embed_dim=32, hidden_size=256, num_layers=2, dropout_rate=0.3):
-        super(MusicRNNV2, self).__init__()
+        super(MusicGruNN, self).__init__()
         
         # 1. Discrete Pitch Embedding
         self.pitch_embedding = nn.Embedding(num_embeddings=num_pitches, embedding_dim=pitch_embed_dim)
@@ -209,7 +209,7 @@ class MusicRNNV2(nn.Module):
         }
 
 # Instantiate the network and push to active hardware
-model = MusicRNNV2().to(device)
+model = MusicGruNN().to(device)
 print(model)
 
 #=======================================================
