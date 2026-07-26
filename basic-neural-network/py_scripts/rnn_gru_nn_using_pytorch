@@ -124,7 +124,7 @@ class BasicRNNForMusic(data.Dataset):
         return len(self.pitches) - self.seq_len
 
     def __getitem__(self, idx):
-        # We need pitch as float for the LSTM input layers, combined with times
+        # We need pitch as float for the GRU input layers, combined with times
         x_pitch = self.pitches[idx : idx + self.seq_len]
         x_time = self.time_features[idx : idx + self.seq_len]
             
@@ -170,8 +170,8 @@ class MusicRNNV2(nn.Module):
         # Total feature size = pitch_embed_dim + 2 (step & duration)
         input_size = pitch_embed_dim + 2
         
-        # 2. Multi-layer LSTM
-        self.lstm = nn.LSTM(
+        # 2. Multi-layer GRU
+        self.gru = nn.GRU(
             input_size=input_size, 
             hidden_size=hidden_size, 
             num_layers=num_layers, 
@@ -196,11 +196,11 @@ class MusicRNNV2(nn.Module):
         # Concatenate embedded pitch with step & duration
         x = torch.cat([pitch_embeds, time_seq], dim=2)
         
-        # Pass through LSTM
-        lstm_out, _ = self.lstm(x)
+        # Pass through GRU
+        gru_out, _ = self.gru(x)
         
         # Extract last step output
-        last_out = self.dropout(lstm_out[:, -1, :])
+        last_out = self.dropout(gru_out[:, -1, :])
         
         return {
             'pitch': self.pitch_head(last_out),
