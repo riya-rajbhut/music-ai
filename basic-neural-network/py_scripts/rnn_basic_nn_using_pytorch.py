@@ -222,7 +222,7 @@ criterion_pitch = nn.CrossEntropyLoss()
 criterion_time = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-epochs = 5  # Set to 5 or 10 epochs for local testing
+epochs = 20  # Set to 5 or 10 epochs for local testing
 print("\n--- Starting Training Optimization Loop ---")
 for epoch in range(epochs):
     model.train()  # Flag training state (activates dropout)
