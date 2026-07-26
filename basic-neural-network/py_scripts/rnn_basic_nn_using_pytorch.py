@@ -135,7 +135,7 @@ class BasicRNNForMusic(data.Dataset):
         return (x_pitch, x_time), (y_pitch, y_time)
 
 seq_len = 30
-batch_size=256
+batch_size=1024
 deterministic_data_seed = 53
 
 torch.manual_seed(deterministic_data_seed)
@@ -227,7 +227,8 @@ print("\n--- Starting Training Optimization Loop ---")
 for epoch in range(epochs):
     model.train()  # Flag training state (activates dropout)
     running_loss = 0.0
-    
+
+    print("Starting with Epoch: {}/{}".format(epoch+1, epochs))
     for batch_idx, (inputs, targets) in enumerate(training_loader):
         print("Starting Training Batch: {}/{}".format(batch_idx+1, len(training_loader)))
 
