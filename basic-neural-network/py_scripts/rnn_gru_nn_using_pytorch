@@ -212,7 +212,7 @@ class MusicGruNN(nn.Module):
 model = MusicGruNN().to(device)
 print(model)
 
-#=======================================================
+#=========================================================
 # Let's Start with Training Loop
 #=======================================================
 from tqdm import tqdm  # pip install tqdm
