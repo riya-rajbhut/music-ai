@@ -19,7 +19,7 @@ def download_maestro_dataset(dest_dir: str='data'):
         print(f"Dataset already downloaded and extracted at {extracted_folder_path}.")
     else:
         print("Downloading the MAESTRO dataset...")
-        download_url_to_file(url, zip_target_path, progress=True)
+        download_url_to_file(url, str(zip_target_path), progress=True)
         print("Download complete...")
 
         if(zip_target_path.exists()):
@@ -37,9 +37,9 @@ def download_maestro_dataset(dest_dir: str='data'):
 
 import pandas as pd
 import collections
+import pretty_midi as pm
 def convert_midi_to_notes(midi_file_path: str) -> pd.DataFrame:
-    import pretty_midi as pm
-    midi_data = pm.PrettyMIDI(midi_file_path)
+    midi_data = pm.PrettyMIDI(str(midi_file_path))
 
     #print(f'Total Instruments in MIDI: {len(midi_data.instruments)}')
     #print all available instruments
@@ -66,23 +66,25 @@ def convert_midi_to_notes(midi_file_path: str) -> pd.DataFrame:
     return converted_notes
 
 def convert_all_songs_to_notes(data_path: str) -> np.ndarray:
-    all_songs_notes = []
+    all_songs_notes_array = []
     all_midi_files = list(pathlib.Path(data_path).glob('**/*.midi'))
 
+    if not all_midi_files:
+        raise FileNotFoundError(f"No MIDI files found in path: {data_path}")
+    
     for midi_file in all_midi_files:
         notes_df = convert_midi_to_notes(midi_file)
-        all_songs_notes.append(notes_df)
+        if notes_df.empty:
+            continue
+
+        single_song_notes_array= notes_df[['pitch', 'step', 'duration']].to_numpy(dtype=np.float32)
+        all_songs_notes_array.append(single_song_notes_array)
     
-    # Concatenate all notes into a single DataFrame
-    all_notes_df = pd.concat(all_songs_notes, ignore_index=True)
-    print(f'Total notes collected from all songs: {len(all_notes_df)}')
-    print(f'Sample of converted notes:\n{all_notes_df.head()}')
+    if not all_songs_notes_array:
+        raise ValueError("No valid note data extracted from any of the MIDI files.")
 
-    # Convert to numpy array for further processing
-    my_notes_array = all_notes_df[['pitch', 'step', 'duration']].to_numpy(dtype=np.float32)
-    print(f'Shape of the final notes array: {my_notes_array.shape}')
-    return my_notes_array
-
+    print(f"Successfully processed {len(all_songs_notes_array)} individual songs.")
+    return all_songs_notes_array # Returns a list of arrays: [ [song1_notes], [song2_notes], ... ]
 
 path_to_data = pathlib.Path('data/maestro-v3.0.0/2004')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -95,40 +97,54 @@ print(f'Converted Notes Array:\n{converted_notes_array[:5]}')  # Print first 5 r
 class BasicRNNForMusic(data.Dataset):
     def __init__(self, notes_array, seq_len=30):
         self.seq_len = seq_len
-        self.data = notes_array.copy()
-        self.data[:, 0] = self.data[:, 0] / 128.0  # Normalize pitch
+        
+        pitches = notes_array[:, 0].astype(int)       # Keep as integers for CrossEntropy
+        time_features = notes_array[:, 1:3].copy()    # step and duration
+        
+
+        self.pitches = torch.tensor(pitches, dtype=torch.long)
+        self.time_features = torch.tensor(time_features, dtype=torch.float32)
 
     def __len__(self):
-        return len(self.data) - self.seq_len
+        return len(self.pitches) - self.seq_len
 
     def __getitem__(self, idx):
-        x = self.data[idx:idx + self.seq_len]
-        y = self.data[idx + self.seq_len]
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+        # We need pitch as float for the LSTM input layers, combined with times
+        x_pitch = self.pitches[idx : idx + self.seq_len].float().unsqueeze(1) / 128.0 # Normalize on-the-fly for inputs only
+        x_time = self.time_features[idx : idx + self.seq_len]
+        x = torch.cat([x_pitch, x_time], dim=1) # Shape: (seq_len, 3)
+        
+        # 2. Extract separate targets (Y)
+        y_pitch = self.pitches[idx + self.seq_len]                 # Scalar tensor (Long) for Classification
+        y_time = self.time_features[idx + self.seq_len]             # Tensor of 2 floats for Regression
+        
+        return x, (y_pitch, y_time)
 
 seq_len = 30
 batch_size=50
 deterministic_data_seed = 53
 
-full_dataset = BasicRNNForMusic(converted_notes_array, seq_len=seq_len)
-full_len = len(full_dataset)
+torch.manual_seed(deterministic_data_seed)
 
-training_data_len = int(0.8 * full_len)
-validation_data_len = int(0.1 * full_len)
-testing_data_len = full_len - training_data_len - validation_data_len
+all_notes_flat = np.concatenate(converted_notes_array, axis=0)
+total_notes = len(all_notes_flat)
+train_cutoff = int(0.8 * total_notes)
+val_cutoff = int(0.9 * total_notes)
+ 
+train_notes = all_notes_flat[:train_cutoff]
+val_notes = all_notes_flat[train_cutoff:val_cutoff]
+test_notes = all_notes_flat[val_cutoff:]
 
-training_dataset, validation_dataset, testing_dataset = data.random_split(full_dataset, [training_data_len, validation_data_len, testing_data_len], generator=torch.Generator().manual_seed(deterministic_data_seed))
+training_dataset = BasicRNNForMusic(train_notes, seq_len=seq_len)
+validation_dataset = BasicRNNForMusic(val_notes, seq_len=seq_len)
+testing_dataset = BasicRNNForMusic(test_notes, seq_len=seq_len)
+print(f"Training Dataset Length: {len(training_dataset)}, Validation Dataset Length: {len(validation_dataset)}, Testing Dataset Length: {len(testing_dataset)}")
 
 training_loader = data.DataLoader(training_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-
-#just check once 
-for x, y in training_loader:
-    print(f"Input batch shape: {x.shape}, Target batch shape: {y.shape}")
-    break  # Just check the first batch 
-
-
+validation_loader = data.DataLoader(validation_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+testing_loader = data.DataLoader(testing_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 class MusicRNN(nn.Module):
-    def __init__(self, input_size=3, hidden_size=128, dropout_rate=0.2):
+    def __init__(self, input_size=3, hidden_size=128, dropout_rate=0.2, num_pitches=128):
         super(MusicRNN, self).__init__()
         
         # LSTM layer expects input shape: (batch, sequence, features)
@@ -136,8 +152,8 @@ class MusicRNN(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
         
         # Multi-Output Heads branching out from the hidden state
-        self.pitch_head = nn.Linear(hidden_size, 1)
-        self.step_head = nn.Linear(hidden_size, 1)
+        self.pitch_head = nn.Linear(hidden_size, num_pitches)
+        self.step_head = nn.Linear(hidden_size, 1)  
         self.duration_head = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
@@ -151,8 +167,9 @@ class MusicRNN(nn.Module):
         
         # Forward pass through individual prediction heads
         pitch_pred = self.pitch_head(last_step_out)
-        step_pred = self.step_head(last_step_out)
-        duration_pred = self.duration_head(last_step_out)
+        # Enforce positive values for time-based metrics
+        step_pred = torch.relu(self.step_head(last_step_out))
+        duration_pred = torch.relu(self.duration_head(last_step_out))
         
         # Return a dictionary of predictions for clear downstream routing
         return {
@@ -165,36 +182,41 @@ class MusicRNN(nn.Module):
 model = MusicRNN().to(device)
 print(model)
 
-# Objective Function and Optimizer bound to model parameters
-criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.005)
+#=======================================================
+# Let's Start with Training Loop
+#=======================================================
+
+# Separate loss criteria for multi-task outputs
+criterion_pitch = nn.CrossEntropyLoss()
+criterion_time = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 epochs = 5  # Set to 5 or 10 epochs for local testing
-model.train()  # Flag training state (activates dropout)
-
 print("\n--- Starting Training Optimization Loop ---")
 for epoch in range(epochs):
+    model.train()  # Flag training state (activates dropout)
     running_loss = 0.0
     
     for batch_idx, (inputs, targets) in enumerate(training_loader):
         # Push batch variables onto target hardware device (CPU or GPU)
-        inputs, targets = inputs.to(device), targets.to(device)
-        
+        inputs = inputs.to(device)
+        y_pitch, y_time = targets
+
         # Deconstruct target slices matching prediction dimensions: shape (batch_size, 1)
-        true_pitch = targets[:, 0].unsqueeze(1)
-        true_step = targets[:, 1].unsqueeze(1)
-        true_duration = targets[:, 2].unsqueeze(1)
+        actual_pitch = y_pitch.to(device)
+        actual_step = y_time[:, 0:1].to(device)
+        actual_duration = y_time[:, 1:2].to(device)
         
-        # 1. Clear previous gradient memory
+        # 1. Clear previous gradient memory in each loop
         optimizer.zero_grad()
         
-        # 2. Compute network predictions
+        # 2. Get the predictions from the model for the current batch
         predictions = model(inputs)
         
         # 3. Calculate individual element losses and aggregate them
-        loss_pitch = criterion(predictions['pitch'], true_pitch)
-        loss_step = criterion(predictions['step'], true_step)
-        loss_duration = criterion(predictions['duration'], true_duration)
+        loss_pitch = criterion_pitch(predictions['pitch'], actual_pitch)
+        loss_step = criterion_time(predictions['step'], actual_step)
+        loss_duration = criterion_time(predictions['duration'], actual_duration)
         
         total_loss = loss_pitch + loss_step + loss_duration
         
@@ -209,36 +231,72 @@ for epoch in range(epochs):
     epoch_loss = running_loss / len(training_loader)
     print(f"Epoch [{epoch+1}/{epochs}] -> Mean Composite Loss: {epoch_loss:.4f}")
 
-model.eval()  # Freeze dropout changes for static evaluations
+#=======================================================
+# Let's Validate our model now
+#=======================================================
+model.eval()  # We don't need to drop out neurons during validations.. hence set this func
+running_val_loss = 0.0
 generated_notes = []
 
-# 1. Grab a starting seed block from your dataset (e.g., first 25 notes)
-# Shape will be: (1, 25, 3) -> adding a manual dummy batch axis
-start_sequence, _ = dataset[0]
-current_input = start_sequence.unsqueeze(0).to(device)
-
-print("\n--- Generating 10 New Notes Iteratively ---")
-with torch.no_grad():  # Turn off gradient engine to maximize inference performance
-    for i in range(10):
+print("\n--- Generating 10 New Notes Iteratively during VALIDATION---")
+with torch.no_grad():  # Turn off gradient engine to maximize inference performance- this is Validation phase hence we dont need
+    for inputs, targets in validation_loader:
+        inputs = inputs.to(device)
+        y_pitch, y_time = targets
+    
+        # Deconstruct target slices matching prediction dimensions: shape (batch_size, 1)
+        actual_pitch = y_pitch.to(device)
+        actual_step = y_time[:, 0:1].to(device)
+        actual_duration = y_time[:, 1:2].to(device)
+    
         # Predict the parameters for the next note
-        preds = model(current_input)
+        preds = model(inputs)
         
-        # Extract scalar float properties from the model output tensor
-        pred_pitch_norm = preds['pitch'].item()
-        pred_step = max(0.0, preds['step'].item())         # Force timing values positive
-        pred_duration = max(0.1, preds['duration'].item()) # Force a minimum audible duration
-        
-        # Denormalize the pitch back up to raw standard MIDI values (0-127)
-        pred_pitch = int(np.clip(pred_pitch_norm * 128.0, 0, 127))
-        
-        # Store predicted notes for inspection
-        generated_notes.append([pred_pitch, pred_step, pred_duration])
-        print(f"Note {i+1:02d}: Pitch={pred_pitch}, Step={pred_step:.3f}s, Duration={pred_duration:.3f}s")
-        
-        # 2. Construct the next step input vector: shape (1, 1, 3)
-        next_note_tensor = torch.tensor([[[pred_pitch_norm, pred_step, pred_duration]]], dtype=torch.float32).to(device)
-        
-        # 3. Slide your window: drop the oldest note and append the newly predicted note
-        current_input = torch.cat((current_input[:, 1:, :], next_note_tensor), dim=1)
+        # Compute combined loss
+        loss_pitch = criterion_pitch(preds['pitch'], actual_pitch)
+        loss_step = criterion_time(preds['step'], actual_step)
+        loss_duration = criterion_time(preds['duration'], actual_duration)
+
+        val_loss = loss_pitch + loss_step + loss_duration
+        running_val_loss += val_loss.item()
+
+avg_val_loss = running_val_loss / len(validation_loader)
+print(f"Validation Loss: {avg_val_loss:.4f}")
+
+#=======================================================
+# TESTING - Let's test our model now
+#=======================================================
+print("\n--- Running Final Testing Loop ---")
+running_test_loss = 0.0
+correct_pitch_predictions = 0
+total_samples = 0
+
+model.eval()  # Set model to evaluation mode
+with torch.no_grad():  # Disable gradient computation for testing
+    for inputs, targets in validation_loader:
+        inputs = inputs.to(device)
+        y_pitch, y_time = targets
+    
+        # Deconstruct target slices matching prediction dimensions: shape (batch_size, 1)
+        actual_pitch = y_pitch.to(device)
+        actual_step = y_time[:, 0:1].to(device)
+        actual_duration = y_time[:, 1:2].to(device)
+
+        preds = model(inputs)
+
+        loss_pitch = criterion_pitch(preds['pitch'], actual_pitch)
+        loss_step = criterion_time(preds['step'], actual_step)
+        loss_duration = criterion_time(preds['duration'], actual_duration)
+        test_loss = loss_pitch + loss_step + loss_duration
+        running_test_loss += test_loss.item()
+
+        predicted_pitch_classes = torch.argmax(preds['pitch'], dim=1)
+        correct_pitch_predictions += (predicted_pitch_classes == actual_pitch).sum().item()
+        total_samples += actual_pitch.size(0)
+
+avg_test_loss = running_test_loss / len(validation_loader)
+accuracy = correct_pitch_predictions / total_samples * 100
+print(f"Test Loss: {avg_test_loss:.4f}, Pitch Prediction Accuracy: {accuracy:.2f}%")
+print("Pitch prediction accuracy on TESTING dataset: {accuracy:.2f}%".format(accuracy=accuracy))
 
 print("\nSample Generation Loop Completed Successfully!")
