@@ -44,7 +44,7 @@ def convert_midi_to_notes(midi_file_path: str) -> pd.DataFrame:
     #print(f'Total Instruments in MIDI: {len(midi_data.instruments)}')
     #print all available instruments
     
-    print(f'Instrument[0]: {midi_data.instruments[0].name}, Program: {midi_data.instruments[0].program}, Is Drum: {midi_data.instruments[0].is_drum}')
+    #print(f'Instrument[0]: {midi_data.instruments[0].name}, Program: {midi_data.instruments[0].program}, Is Drum: {midi_data.instruments[0].is_drum}')
 
     instrument = midi_data.instruments[0]  # Assuming single instrument for simplicity
     notes = collections.defaultdict(list)
@@ -62,7 +62,7 @@ def convert_midi_to_notes(midi_file_path: str) -> pd.DataFrame:
 
     
     converted_notes = pd.DataFrame({name: np.array(values) for name, values in notes.items()})
-    print(f'Sample of converted notes:\n{converted_notes.head()}')
+    #print(f'Sample of converted notes:\n{converted_notes.head()}')
     return converted_notes
 
 def convert_all_songs_to_notes(data_path: str) -> np.ndarray:
@@ -86,93 +86,145 @@ def convert_all_songs_to_notes(data_path: str) -> np.ndarray:
     print(f"Successfully processed {len(all_songs_notes_array)} individual songs.")
     return all_songs_notes_array # Returns a list of arrays: [ [song1_notes], [song2_notes], ... ]
 
-path_to_data = pathlib.Path('data/maestro-v3.0.0/2004')
+path_to_data = pathlib.Path('data/maestro-v3.0.0')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-#Training loopwas taking much more time,hence caching converted notes.
-cache_file = pathlib.Path('data/maestro-v3.0.0/converted_notes_cache.npy')
+import pathlib
+import pickle
+
+# Define your centralized cache file location (with correct .pkl extension)
+cache_file = pathlib.Path('data/maestro-v3.0.0/converted_notes_array.pkl')
+
 if cache_file.exists():
     print(f"Loading converted notes from cache: {cache_file}")
-    converted_notes_array = np.load(cache_file, allow_pickle=True)
+    # FIX: Pass the Path object directly to open() so it loads from the correct folder
+    with open(cache_file, 'rb') as f:
+        converted_notes_array = pickle.load(f)
+    print("Cache loaded successfully!")
 else:
+    print(f"Cache file not found at {cache_file}. Starting dataset processing...")
     download_maestro_dataset()
+    print(f"Now,converting all MIDI files in {path_to_data} to note arrays... \n this may take a few minutes depending on the number of files and their sizes.")
     converted_notes_array = convert_all_songs_to_notes(path_to_data)
     
-print(f'Converted Notes Array:\n{converted_notes_array[:5]}')  # Print first 5 rows of the array
-all_notes_flat = np.vstack(converted_notes_array) # np.concatenate(converted_notes_array, axis=0)
-print(f"Flattened Array Shape: {all_notes_flat.shape}")
+    # Print first 5 rows of the array
+    print(f'Converted Notes Array Sample:\n{converted_notes_array[:5]}') 
+    
+    # Create parent directories automatically if they do not exist yet
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    # FIX: Pass the Path object to save it directly into the maestro folder
+    with open(cache_file, 'wb') as f:
+        pickle.dump(converted_notes_array, f)
+    print(f"Cache saved successfully to: {cache_file}")
 
-if not cache_file.exists():
-    np.save(cache_file, all_notes_flat)
 
 class GruMusicDataset(data.Dataset):
-    def __init__(self, notes_array, seq_len=30):
+    def __init__(self, songs_list, seq_len=30):
         self.seq_len = seq_len
+        self.samples = []
 
-        notes_array = np.array(notes_array)
-        if notes_array.ndim == 1:
-            raise ValueError(f"Expected 2D array with shape (N, 3), but got 1D array with shape {notes_array.shape}")
-        
-        pitches = notes_array[:, 0].astype(int)       # Keep as integers for CrossEntropy
-        time_features = notes_array[:, 1:3].copy()    # step and duration
-        
-        self.pitches = torch.tensor(pitches, dtype=torch.long)
-        self.time_features = torch.tensor(time_features, dtype=torch.float32)
+        for notes_array in songs_list:
+            if len(notes_array) <= seq_len:
+                continue  # Skip sequences that are too short
+            pitches = notes_array[:, 0].astype(int)
+            # Log-transform times to squash extreme outliers (helps neural networks scale)
+            time_features = np.log1p(notes_array[:, 1:3]) 
+             # Form sliding windows strictly within this song's boundaries
+            for i in range(len(notes_array) - seq_len):
+                self.samples.append({
+                    'x_pitch': torch.tensor(pitches[i : i + seq_len], dtype=torch.long),
+                    'x_time': torch.tensor(time_features[i : i + seq_len], dtype=torch.float32),
+                    'y_pitch': torch.tensor(pitches[i + seq_len], dtype=torch.long),
+                    'y_time': torch.tensor(time_features[i + seq_len], dtype=torch.float32)
+                })
 
     def __len__(self):
-        return len(self.pitches) - self.seq_len
+        return len(self.samples) - self.seq_len
 
     def __getitem__(self, idx):
-        # We need pitch as float for the GRU input layers, combined with times
-        x_pitch = self.pitches[idx : idx + self.seq_len]
-        x_time = self.time_features[idx : idx + self.seq_len]
-            
-        # 2. Extract separate targets (Y)
-        y_pitch = self.pitches[idx + self.seq_len]                 # Scalar tensor (Long) for Classification
-        y_time = self.time_features[idx + self.seq_len]             # Tensor of 2 floats for Regression
-        
-        return (x_pitch, x_time), (y_pitch, y_time)
+        s = self.samples[idx]
+        return (s['x_pitch'], s['x_time']), (s['y_pitch'], s['y_time'])
 
-seq_len = 30
-batch_size=1024
+# Create a lightweight dataset that doesn't need to recalculate everything
+class FastGruMusicDataset(data.Dataset):
+    def __init__(self, x_pitch, x_time, y_pitch, y_time):
+        # Store as raw arrays; convert to tensors rapidly inside __getitem__
+        self.x_pitch = x_pitch
+        self.x_time = x_time
+        self.y_pitch = y_pitch
+        self.y_time = y_time
+
+    def __len__(self):
+        return len(self.x_pitch)
+
+    def __getitem__(self, idx):
+        return (
+            torch.tensor(self.x_pitch[idx], dtype=torch.long),
+            torch.tensor(self.x_time[idx], dtype=torch.float32)
+        ), (
+            torch.tensor(self.y_pitch[idx], dtype=torch.long),
+            torch.tensor(self.y_time[idx], dtype=torch.float32)
+        )
+
+def prepare_fast_dataset(songs_list, seq_len=30):
+    all_x_pitch, all_x_time, all_y_pitch, all_y_time = [], [], [], []
+    
+    for notes_array in songs_list:
+        if len(notes_array) <= seq_len:
+            continue
+        pitches = notes_array[:, 0].astype(np.int16) # Compress down to save RAM
+        time_feats = np.log1p(notes_array[:, 1:3]).astype(np.float32)
+        
+        # Fast slicing via vectorization views
+        for i in range(len(notes_array) - seq_len):
+            all_x_pitch.append(pitches[i : i + seq_len])
+            all_x_time.append(time_feats[i : i + seq_len])
+            all_y_pitch.append(pitches[i + seq_len])
+            all_y_time.append(time_feats[i + seq_len])
+            
+    return FastGruMusicDataset(
+        np.array(all_x_pitch), np.array(all_x_time),
+        np.array(all_y_pitch), np.array(all_y_time)
+    )
+
+seq_len = 50
+batch_size = 4096
 deterministic_data_seed = 53
 
 torch.manual_seed(deterministic_data_seed)
 
+total_songs = len(converted_notes_array)
+train_cutoff = int(0.8 * total_songs)
+val_cutoff = int(0.9 * total_songs)
 
-total_notes = len(all_notes_flat)
-train_cutoff = int(0.8 * total_notes)
-val_cutoff = int(0.9 * total_notes)
- 
-train_notes = all_notes_flat[:train_cutoff]
-val_notes = all_notes_flat[train_cutoff:val_cutoff]
-test_notes = all_notes_flat[val_cutoff:]
-
-training_dataset = GruMusicDataset(train_notes, seq_len=seq_len)
-validation_dataset = GruMusicDataset(val_notes, seq_len=seq_len)
-testing_dataset = GruMusicDataset(test_notes, seq_len=seq_len)
+training_dataset = prepare_fast_dataset(converted_notes_array[:train_cutoff])
+validation_dataset = prepare_fast_dataset(converted_notes_array[train_cutoff:val_cutoff], seq_len=30)
+testing_dataset = prepare_fast_dataset(converted_notes_array[val_cutoff:], seq_len=30)
 print(f"Training Dataset Length: {len(training_dataset)}, Validation Dataset Length: {len(validation_dataset)}, Testing Dataset Length: {len(testing_dataset)}")
 
 training_loader = data.DataLoader(training_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 validation_loader = data.DataLoader(validation_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 testing_loader = data.DataLoader(testing_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
-import torch
-import torch.nn as nn
 
 class MusicGruNN(nn.Module):
-    def __init__(self, num_pitches=128, pitch_embed_dim=32, hidden_size=256, num_layers=2, dropout_rate=0.3):
+    def __init__(self, num_pitches=128, pitch_embed_dim=64, hidden_size=256, num_layers=2, dropout_rate=0.15):
         super(MusicGruNN, self).__init__()
         
-        # 1. Discrete Pitch Embedding
+        # Upgraded embedding size to 64 for better note expression representation
         self.pitch_embedding = nn.Embedding(num_embeddings=num_pitches, embedding_dim=pitch_embed_dim)
         
-        # Total feature size = pitch_embed_dim + 2 (step & duration)
-        input_size = pitch_embed_dim + 2
+        # FIX: Added an input projection mapping layer to normalize mixed feature types
+        self.input_mapping = nn.Sequential(
+            nn.Linear(pitch_embed_dim + 2, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU()
+        )
         
-        # 2. Multi-layer GRU
+        # Adjusted dropout rate down to 0.15 to mitigate early memory loss
         self.gru = nn.GRU(
-            input_size=input_size, 
+            input_size=hidden_size, # Input size matches hidden size now due to mapping
             hidden_size=hidden_size, 
             num_layers=num_layers, 
             batch_first=True, 
@@ -180,26 +232,20 @@ class MusicGruNN(nn.Module):
         )
         
         self.dropout = nn.Dropout(dropout_rate)
-        
-        # 3. Prediction Heads
         self.pitch_head = nn.Linear(hidden_size, num_pitches)
         self.step_head = nn.Linear(hidden_size, 1)
         self.duration_head = nn.Linear(hidden_size, 1)
 
     def forward(self, pitch_seq, time_seq):
-        # pitch_seq shape: (batch_size, seq_len) [LongTensor]
-        # time_seq shape:  (batch_size, seq_len, 2) [FloatTensor]
-        
-        # Embed pitches -> shape: (batch_size, seq_len, pitch_embed_dim)
         pitch_embeds = self.pitch_embedding(pitch_seq)
         
-        # Concatenate embedded pitch with step & duration
+        # Concatenate features
         x = torch.cat([pitch_embeds, time_seq], dim=2)
         
-        # Pass through GRU
-        gru_out, _ = self.gru(x)
+        # FIX: Map combined vectors cleanly into hidden space prior to recurrent cells
+        gru_input = self.input_mapping(x)
         
-        # Extract last step output
+        gru_out, _ = self.gru(gru_input)
         last_out = self.dropout(gru_out[:, -1, :])
         
         return {
@@ -222,8 +268,8 @@ criterion_pitch = nn.CrossEntropyLoss()
 criterion_time = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-epochs = 5  # Set to 5 or 10 epochs for local testing
-print("\n--- Starting Training Optimization Loop ---")
+epochs = 30  # Set to 5 or 10 epochs for local testing
+print("\n--- Starting GRU Training Optimization Loop ---")
 for epoch in range(epochs):
     model.train()  # Flag training state (activates dropout)
     running_loss = 0.0
@@ -310,7 +356,7 @@ total_samples = 0
 
 model.eval()  # Set model to evaluation mode
 with torch.no_grad():  # Disable gradient computation for testing
-    for inputs, targets in validation_loader:
+    for inputs, targets in testing_loader:
         x_pitch, x_time = inputs
         x_pitch, x_time = x_pitch.to(device, non_blocking=True), x_time.to(device, non_blocking=True)
 
@@ -333,7 +379,7 @@ with torch.no_grad():  # Disable gradient computation for testing
         correct_pitch_predictions += (predicted_pitch_classes == actual_pitch).sum().item()
         total_samples += actual_pitch.size(0)
 
-avg_test_loss = running_test_loss / len(validation_loader)
+avg_test_loss = running_test_loss / len(testing_loader)
 accuracy = correct_pitch_predictions / total_samples * 100
 print(f"Test Loss: {avg_test_loss:.4f}, Pitch Prediction Accuracy: {accuracy:.2f}%")
 print("Pitch prediction accuracy on TESTING dataset: {accuracy:.2f}%".format(accuracy=accuracy))
