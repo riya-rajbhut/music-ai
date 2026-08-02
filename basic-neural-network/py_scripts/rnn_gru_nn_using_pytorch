@@ -276,7 +276,7 @@ for epoch in range(epochs):
 
     print("Starting with Epoch: {}/{}".format(epoch+1, epochs))
     for batch_idx, (inputs, targets) in enumerate(training_loader):
-        print("Starting Training Batch: {}/{}".format(batch_idx+1, len(training_loader)))
+        #print("Starting Training Batch: {}/{}".format(batch_idx+1, len(training_loader)))
 
         # Push batch variables onto target hardware device (CPU or GPU)
         x_pitch, x_time = inputs
