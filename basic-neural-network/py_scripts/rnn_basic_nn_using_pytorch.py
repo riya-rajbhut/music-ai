@@ -44,7 +44,7 @@ def convert_midi_to_notes(midi_file_path: str) -> pd.DataFrame:
     #print(f'Total Instruments in MIDI: {len(midi_data.instruments)}')
     #print all available instruments
     
-    print(f'Instrument[0]: {midi_data.instruments[0].name}, Program: {midi_data.instruments[0].program}, Is Drum: {midi_data.instruments[0].is_drum}')
+    #print(f'Instrument[0]: {midi_data.instruments[0].name}, Program: {midi_data.instruments[0].program}, Is Drum: {midi_data.instruments[0].is_drum}')
 
     instrument = midi_data.instruments[0]  # Assuming single instrument for simplicity
     notes = collections.defaultdict(list)
@@ -222,7 +222,7 @@ criterion_pitch = nn.CrossEntropyLoss()
 criterion_time = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-epochs = 20  # Set to 5 or 10 epochs for local testing
+epochs = 60  # Improvement: Updated to 60. Set to 5 or 10 epochs for local testing
 print("\n--- Starting Training Optimization Loop ---")
 for epoch in range(epochs):
     model.train()  # Flag training state (activates dropout)
@@ -230,7 +230,7 @@ for epoch in range(epochs):
 
     print("Starting with Epoch: {}/{}".format(epoch+1, epochs))
     for batch_idx, (inputs, targets) in enumerate(training_loader):
-        print("Starting Training Batch: {}/{}".format(batch_idx+1, len(training_loader)))
+        #print("Starting Training Batch: {}/{}".format(batch_idx+1, len(training_loader)))
 
         # Push batch variables onto target hardware device (CPU or GPU)
         x_pitch, x_time = inputs
@@ -250,13 +250,17 @@ for epoch in range(epochs):
         
         # 3. Calculate individual element losses and aggregate them
         loss_pitch = criterion_pitch(predictions['pitch'], actual_pitch)
-        loss_step = criterion_time(predictions['step'], actual_step)
-        loss_duration = criterion_time(predictions['duration'], actual_duration)
+        # Improvement: Re-scaled continuous predictions so they do not overshadow the pitch loss
+        loss_step = criterion_time(predictions['step'], torch.log1p(actual_step)) 
+        loss_duration = criterion_time(predictions['duration'], torch.log1p(actual_duration)) 
         
-        total_loss = loss_pitch + 10.0 *(loss_step + loss_duration)
+        total_loss = loss_pitch + 5.5 *(loss_step + loss_duration)
         
         # 4. Backward error propagation
         total_loss.backward()
+
+        # Improvement: Gradient clipping to protect parameters against explosion spikes
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         # 5. Fine-tune model parameters
         optimizer.step()
@@ -310,7 +314,7 @@ total_samples = 0
 
 model.eval()  # Set model to evaluation mode
 with torch.no_grad():  # Disable gradient computation for testing
-    for inputs, targets in validation_loader:
+    for inputs, targets in testing_loader:
         x_pitch, x_time = inputs
         x_pitch, x_time = x_pitch.to(device, non_blocking=True), x_time.to(device, non_blocking=True)
 
