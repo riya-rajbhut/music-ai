@@ -1,5 +1,10 @@
 # music-ai
 This repository will store project for Music related AI processing
+# While running code via Kaggle Notebook
+# Replace with your actual GitHub repository URL
+!git clone https://github.com
+
+!pip install -r requirements.txt
 
 # While running code via python
 Create virtual env first
