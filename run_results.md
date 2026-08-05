@@ -22,3 +22,18 @@ Pitch prediction accuracy on TESTING dataset: 16.84%
 Total time taken for training, validation, and testing: 0.64 hours
 
 Sample Generation Loop Completed Successfully!
+
+--------------------------------------------------
+another run
+--------------------------------------------------
+Epoch [60/60] -> Mean Composite Loss: 2.4518
+
+--- Generating 10 New Notes Iteratively during VALIDATION---
+Validation Loss: 3.0484
+
+--- Running Final Testing Loop ---
+Test Loss: 3.2780, Pitch Prediction Accuracy: 20.88%
+Pitch prediction accuracy on TESTING dataset: 20.88%
+
+Sample Generation Loop Completed Successfully!
+
