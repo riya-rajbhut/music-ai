@@ -66,7 +66,7 @@ def convert_midi_to_notes(midi_file_path: str) -> pd.DataFrame:
 
     
     converted_notes = pd.DataFrame({name: np.array(values) for name, values in notes.items()})
-    print(f'Sample of converted notes:\n{converted_notes.head()}')
+   # print(f'Sample of converted notes:\n{converted_notes.head()}')
     return converted_notes
 
 def convert_all_songs_to_notes(data_roots) -> np.ndarray:
