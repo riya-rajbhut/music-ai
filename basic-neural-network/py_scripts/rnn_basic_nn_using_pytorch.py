@@ -1,10 +1,12 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 import torch.utils.data as data
 import pathlib
+import pickle
 import numpy as np
 
 from torch.hub import download_url_to_file
@@ -86,53 +88,129 @@ def convert_all_songs_to_notes(data_path: str) -> np.ndarray:
     print(f"Successfully processed {len(all_songs_notes_array)} individual songs.")
     return all_songs_notes_array # Returns a list of arrays: [ [song1_notes], [song2_notes], ... ]
 
-path_to_data = pathlib.Path('data/maestro-v3.0.0/2004')
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+def load_or_create_note_cache(data_path: pathlib.Path, dataset_root: pathlib.Path):
+    song_cache_file = dataset_root / 'converted_notes_array.pkl'
+    legacy_cache_file = dataset_root / 'converted_notes_cache.npy'
 
-#Training loopwas taking much more time,hence caching converted notes.
-cache_file = pathlib.Path('data/maestro-v3.0.0/converted_notes_cache.npy')
-if cache_file.exists():
-    print(f"Loading converted notes from cache: {cache_file}")
-    converted_notes_array = np.load(cache_file, allow_pickle=True)
-else:
+    if song_cache_file.exists():
+        print(f"Loading song-wise converted notes from cache: {song_cache_file}")
+        with song_cache_file.open('rb') as cache_handle:
+            return pickle.load(cache_handle)
+
+    if legacy_cache_file.exists():
+        legacy_cache = np.load(legacy_cache_file, allow_pickle=True)
+        if legacy_cache.ndim == 1:
+            print(f"Loading song-wise converted notes from legacy cache: {legacy_cache_file}")
+            return list(legacy_cache)
+
+        print("Legacy flat cache detected. Rebuilding a song-wise cache to avoid training across song boundaries.")
+
     download_maestro_dataset()
-    converted_notes_array = convert_all_songs_to_notes(path_to_data)
-    
-print(f'Converted Notes Array:\n{converted_notes_array[:5]}')  # Print first 5 rows of the array
-all_notes_flat = np.vstack(converted_notes_array) # np.concatenate(converted_notes_array, axis=0)
+    converted_notes = convert_all_songs_to_notes(data_path)
+
+    with song_cache_file.open('wb') as cache_handle:
+        pickle.dump(converted_notes, cache_handle)
+
+    return converted_notes
+
+
+dataset_root = pathlib.Path('data/maestro-v3.0.0')
+path_to_data = dataset_root / '2004'
+
+
+def log_cuda_environment() -> None:
+    if not torch.cuda.is_available():
+        print("CUDA not available. Training will run on CPU.")
+        return
+
+    print(f"CUDA devices available: {torch.cuda.device_count()}")
+    for device_index in range(torch.cuda.device_count()):
+        print(f"CUDA device {device_index}: {torch.cuda.get_device_name(device_index)}")
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+available_gpu_count = torch.cuda.device_count()
+pin_memory = device.type == "cuda"
+loader_num_workers = 2 if pin_memory else 0
+
+if pin_memory:
+    torch.backends.cudnn.benchmark = True
+
+print(f"Using device: {device}")
+log_cuda_environment()
+
+# Training loop was taking much more time, hence caching converted notes.
+converted_notes_array = load_or_create_note_cache(path_to_data, dataset_root)
+print(f"Loaded {len(converted_notes_array)} songs of note events.")
+all_notes_flat = np.vstack(converted_notes_array)
 print(f"Flattened Array Shape: {all_notes_flat.shape}")
 
-if not cache_file.exists():
-    np.save(cache_file, all_notes_flat)
-
 class BasicRNNForMusic(data.Dataset):
-    def __init__(self, notes_array, seq_len=30):
+    def __init__(self, song_note_arrays, seq_len=30):
         self.seq_len = seq_len
+        self.song_pitches = []
+        self.song_time_features = []
+        self.index_map = []
 
-        notes_array = np.array(notes_array)
-        if notes_array.ndim == 1:
-            raise ValueError(f"Expected 2D array with shape (N, 3), but got 1D array with shape {notes_array.shape}")
-        
-        pitches = notes_array[:, 0].astype(int)       # Keep as integers for CrossEntropy
-        time_features = notes_array[:, 1:3].copy()    # step and duration
-        
-        self.pitches = torch.tensor(pitches, dtype=torch.long)
-        self.time_features = torch.tensor(time_features, dtype=torch.float32)
+        for song_notes in song_note_arrays:
+            notes_array = np.asarray(song_notes, dtype=np.float32)
+            if notes_array.ndim != 2 or notes_array.shape[1] != 3:
+                raise ValueError(f"Expected 2D array with shape (N, 3), but got shape {notes_array.shape}")
+
+            if len(notes_array) <= self.seq_len:
+                continue
+
+            pitches = notes_array[:, 0].astype(np.int64)
+            time_features = np.log1p(notes_array[:, 1:3])
+
+            song_index = len(self.song_pitches)
+            self.song_pitches.append(torch.tensor(pitches, dtype=torch.long))
+            self.song_time_features.append(torch.tensor(time_features, dtype=torch.float32))
+            self.index_map.extend((song_index, start_idx) for start_idx in range(len(pitches) - self.seq_len))
+
+        if not self.index_map:
+            raise ValueError("No sequences could be created from the provided songs.")
 
     def __len__(self):
-        return len(self.pitches) - self.seq_len
+        return len(self.index_map)
 
     def __getitem__(self, idx):
-        # We need pitch as float for the LSTM input layers, combined with times
-        x_pitch = self.pitches[idx : idx + self.seq_len]
-        x_time = self.time_features[idx : idx + self.seq_len]
+        song_index, start_idx = self.index_map[idx]
+        song_pitches = self.song_pitches[song_index]
+        song_times = self.song_time_features[song_index]
+
+        x_pitch = song_pitches[start_idx : start_idx + self.seq_len]
+        x_time = song_times[start_idx : start_idx + self.seq_len]
             
-        # 2. Extract separate targets (Y)
-        y_pitch = self.pitches[idx + self.seq_len]                 # Scalar tensor (Long) for Classification
-        y_time = self.time_features[idx + self.seq_len]             # Tensor of 2 floats for Regression
+        y_pitch = song_pitches[start_idx + self.seq_len]
+        y_time = song_times[start_idx + self.seq_len]
         
         return (x_pitch, x_time), (y_pitch, y_time)
+
+
+def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
+    song_indices = np.random.default_rng(seed).permutation(len(song_note_arrays))
+    train_cutoff = int(len(song_indices) * train_ratio)
+    val_cutoff = int(len(song_indices) * (train_ratio + val_ratio))
+
+    train_songs = [song_note_arrays[index] for index in song_indices[:train_cutoff]]
+    val_songs = [song_note_arrays[index] for index in song_indices[train_cutoff:val_cutoff]]
+    test_songs = [song_note_arrays[index] for index in song_indices[val_cutoff:]]
+    return train_songs, val_songs, test_songs
+
+
+def build_pitch_class_weights(song_note_arrays, num_pitches=128):
+    pitch_counts = np.zeros(num_pitches, dtype=np.float32)
+
+    for song_notes in song_note_arrays:
+        pitches = np.asarray(song_notes)[:, 0].astype(np.int64)
+        pitch_counts += np.bincount(pitches, minlength=num_pitches)
+
+    observed = pitch_counts > 0
+    pitch_weights = np.zeros(num_pitches, dtype=np.float32)
+    pitch_weights[observed] = np.power(pitch_counts[observed], -0.5)
+    pitch_weights[observed] /= pitch_weights[observed].mean()
+    return torch.tensor(pitch_weights, dtype=torch.float32)
 
 seq_len = 30
 batch_size=1024
@@ -140,25 +218,40 @@ deterministic_data_seed = 53
 
 torch.manual_seed(deterministic_data_seed)
 
-
-total_notes = len(all_notes_flat)
-train_cutoff = int(0.8 * total_notes)
-val_cutoff = int(0.9 * total_notes)
- 
-train_notes = all_notes_flat[:train_cutoff]
-val_notes = all_notes_flat[train_cutoff:val_cutoff]
-test_notes = all_notes_flat[val_cutoff:]
+train_notes, val_notes, test_notes = split_song_arrays(converted_notes_array, seed=deterministic_data_seed)
 
 training_dataset = BasicRNNForMusic(train_notes, seq_len=seq_len)
 validation_dataset = BasicRNNForMusic(val_notes, seq_len=seq_len)
 testing_dataset = BasicRNNForMusic(test_notes, seq_len=seq_len)
 print(f"Training Dataset Length: {len(training_dataset)}, Validation Dataset Length: {len(validation_dataset)}, Testing Dataset Length: {len(testing_dataset)}")
 
-training_loader = data.DataLoader(training_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-validation_loader = data.DataLoader(validation_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
-testing_loader = data.DataLoader(testing_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
-import torch
-import torch.nn as nn
+training_loader = data.DataLoader(
+    training_dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    drop_last=True,
+    pin_memory=pin_memory,
+    num_workers=loader_num_workers,
+    persistent_workers=loader_num_workers > 0,
+)
+validation_loader = data.DataLoader(
+    validation_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    drop_last=False,
+    pin_memory=pin_memory,
+    num_workers=loader_num_workers,
+    persistent_workers=loader_num_workers > 0,
+)
+testing_loader = data.DataLoader(
+    testing_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    drop_last=False,
+    pin_memory=pin_memory,
+    num_workers=loader_num_workers,
+    persistent_workers=loader_num_workers > 0,
+)
 
 class MusicRNNV2(nn.Module):
     def __init__(self, num_pitches=128, pitch_embed_dim=32, hidden_size=256, num_layers=2, dropout_rate=0.3):
@@ -204,23 +297,27 @@ class MusicRNNV2(nn.Module):
         
         return {
             'pitch': self.pitch_head(last_out),
-            'step': torch.relu(self.step_head(last_out)),
-            'duration': torch.relu(self.duration_head(last_out))
+            'step': F.softplus(self.step_head(last_out)),
+            'duration': F.softplus(self.duration_head(last_out))
         }
 
 # Instantiate the network and push to active hardware
 model = MusicRNNV2().to(device)
+
+if available_gpu_count > 1 and device.type == "cuda":
+    model = nn.DataParallel(model)
+    print(f"Using nn.DataParallel across {available_gpu_count} GPUs.")
+else:
+    print("Using a single device for training.")
+
 print(model)
 
-#=======================================================
-# Let's Start with Training Loop
-#=======================================================
-from tqdm import tqdm  # pip install tqdm
-
 # Separate loss criteria for multi-task outputs
-criterion_pitch = nn.CrossEntropyLoss()
-criterion_time = nn.MSELoss()
+pitch_class_weights = build_pitch_class_weights(train_notes).to(device)
+criterion_pitch = nn.CrossEntropyLoss(weight=pitch_class_weights, label_smoothing=0.05)
+criterion_time = nn.SmoothL1Loss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
+time_loss_weight = 2.0
 
 epochs = 60  # Improvement: Updated to 60. Set to 5 or 10 epochs for local testing
 print("\n--- Starting Training Optimization Loop ---")
@@ -250,11 +347,10 @@ for epoch in range(epochs):
         
         # 3. Calculate individual element losses and aggregate them
         loss_pitch = criterion_pitch(predictions['pitch'], actual_pitch)
-        # Improvement: Re-scaled continuous predictions so they do not overshadow the pitch loss
-        loss_step = criterion_time(predictions['step'], torch.log1p(actual_step)) 
-        loss_duration = criterion_time(predictions['duration'], torch.log1p(actual_duration)) 
+        loss_step = criterion_time(predictions['step'], actual_step)
+        loss_duration = criterion_time(predictions['duration'], actual_duration)
         
-        total_loss = loss_pitch + 5.5 *(loss_step + loss_duration)
+        total_loss = loss_pitch + time_loss_weight * (loss_step + loss_duration)
         
         # 4. Backward error propagation
         total_loss.backward()
@@ -298,7 +394,7 @@ with torch.no_grad():  # Turn off gradient engine to maximize inference performa
         loss_step = criterion_time(preds['step'], actual_step)
         loss_duration = criterion_time(preds['duration'], actual_duration)
 
-        val_loss = loss_pitch + loss_step + loss_duration
+        val_loss = loss_pitch + time_loss_weight * (loss_step + loss_duration)
         running_val_loss += val_loss.item()
 
 avg_val_loss = running_val_loss / len(validation_loader)
@@ -330,14 +426,14 @@ with torch.no_grad():  # Disable gradient computation for testing
         loss_pitch = criterion_pitch(preds['pitch'], actual_pitch)
         loss_step = criterion_time(preds['step'], actual_step)
         loss_duration = criterion_time(preds['duration'], actual_duration)
-        test_loss = loss_pitch + loss_step + loss_duration
+        test_loss = loss_pitch + time_loss_weight * (loss_step + loss_duration)
         running_test_loss += test_loss.item()
 
         predicted_pitch_classes = torch.argmax(preds['pitch'], dim=1)
         correct_pitch_predictions += (predicted_pitch_classes == actual_pitch).sum().item()
         total_samples += actual_pitch.size(0)
 
-avg_test_loss = running_test_loss / len(validation_loader)
+avg_test_loss = running_test_loss / len(testing_loader)
 accuracy = correct_pitch_predictions / total_samples * 100
 print(f"Test Loss: {avg_test_loss:.4f}, Pitch Prediction Accuracy: {accuracy:.2f}%")
 print("Pitch prediction accuracy on TESTING dataset: {accuracy:.2f}%".format(accuracy=accuracy))

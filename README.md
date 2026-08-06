@@ -8,6 +8,11 @@ python -m venv .venv-rnn
 Activate virtual env
 .venv-rnn\Scripts\activate
 
+--------------------------------------------
+If u get policy error while activating python env - 
+
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force; .\music_env_3.14\Scripts\Activate.ps1; python --version
+--------------------------------------------
 python.exe -m pip install --upgrade pip
 
 For Basic RNN training program - I have added following modules inside my own created Virtual env
