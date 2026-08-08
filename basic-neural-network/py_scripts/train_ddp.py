@@ -3,6 +3,16 @@ import os
 import pathlib
 import pickle
 import collections
+import time
+import resource
+import warnings
+
+# CHANGE: pretty_midi's instrument.py internally does `import pkg_resources`, which
+# newer setuptools (81+) flags with this warning. It's coming from pretty_midi's own
+# code, not this script, and doesn't affect training — this filter must be registered
+# before `import pretty_midi` below, since the warning fires at import time.
+warnings.filterwarnings('ignore', message='pkg_resources is deprecated as an API')
+
 import numpy as np
 import pandas as pd
 import pretty_midi as pm
@@ -84,16 +94,22 @@ def build_cache_tag(selected_years) -> str:
     joined_years = "-".join(selected_years)
     return joined_years if len(joined_years) <= 80 else f"{selected_years[0]}-{selected_years[-1]}-{len(selected_years)}years"
 
-def resolve_training_years(dataset_root: pathlib.Path, selected_years):
+def resolve_training_years(dataset_root: pathlib.Path, selected_years, max_years=None, seed=0):
     available_year_paths = sorted(
         year_path for year_path in dataset_root.iterdir() if year_path.is_dir() and year_path.name.isdigit()
     )
     available_year_names = [year_path.name for year_path in available_year_paths]
 
-    # CHANGE: 'all' (or None) now auto-expands to every year found in the dataset,
-    # instead of being locked to a hardcoded 5-year subset.
+    # 'all' (or None) auto-expands to every year found in the dataset.
     if selected_years in (None, 'all'):
         selected_years = available_year_names
+
+        # CHANGE: max_years caps how many auto-discovered years actually get used,
+        # without needing to hardcode/guess exact folder names (risky across MAESTRO
+        # versions). Seeded so the sample is reproducible and identical across DDP ranks.
+        if max_years is not None and max_years < len(selected_years):
+            rng = np.random.default_rng(seed)
+            selected_years = sorted(rng.choice(selected_years, size=max_years, replace=False).tolist())
 
     unknown_years = [year for year in selected_years if year not in available_year_names]
     if unknown_years:
@@ -305,7 +321,9 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
 
     # CHANGE: resolve_training_years now also returns the resolved year list (in case
     # 'all' was passed), so the cache tag and logs reflect what was actually used.
-    selected_year_paths, _, resolved_years = resolve_training_years(dataset_root, selected_years)
+    selected_year_paths, _, resolved_years = resolve_training_years(
+        dataset_root, selected_years, max_years=hyperparameters.get('max_years'), seed=hyperparameters['seed']
+    )
     cache_tag = build_cache_tag(resolved_years)
     converted_notes_array = load_or_create_note_cache(selected_year_paths, dataset_root, cache_tag, is_main_process)
 
@@ -329,11 +347,24 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
         print(f"Years used: {resolved_years}")
         print(f"Train examples: {len(train_dataset)}, Val examples: {len(val_dataset)}, Test examples: {len(test_dataset)}")
 
+    # CHANGE: peak host RAM for THIS process, printed per rank (not just main). Each DDP
+    # rank builds its own full copy of train/val/test in host memory — if this number is
+    # high on both ranks, that confirms years + augmentation volume is what's driving
+    # your 28/32GB RAM usage, not a leak elsewhere.
+    peak_rss_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 2)
+    print(f"[rank {rank}] Peak host RAM after building datasets: {peak_rss_gb:.2f} GB")
+
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
-    train_loader = data.DataLoader(train_dataset, batch_size=hyperparameters['batch_size_per_gpu'], sampler=train_sampler, pin_memory=True, num_workers=2, drop_last=True)
-    val_loader = data.DataLoader(val_dataset, batch_size=hyperparameters['batch_size_per_gpu'], sampler=val_sampler, pin_memory=True, num_workers=2, drop_last=False)
+    # CHANGE: persistent_workers=True keeps worker processes alive across epochs instead
+    # of tearing them down and recreating them every epoch (the default). This is almost
+    # certainly why the pkg_resources warning kept reappearing every epoch in your log —
+    # each fresh worker re-imports the whole script, including pretty_midi, from scratch.
+    # prefetch_factor tells each worker to prepare batches ahead of time so the GPU
+    # isn't left waiting on the CPU between steps.
+    train_loader = data.DataLoader(train_dataset, batch_size=hyperparameters['batch_size_per_gpu'], sampler=train_sampler, pin_memory=True, num_workers=2, drop_last=True, persistent_workers=True, prefetch_factor=4)
+    val_loader = data.DataLoader(val_dataset, batch_size=hyperparameters['batch_size_per_gpu'], sampler=val_sampler, pin_memory=True, num_workers=2, drop_last=False, persistent_workers=True, prefetch_factor=4)
     test_loader = data.DataLoader(test_dataset, batch_size=hyperparameters['batch_size_per_gpu'], pin_memory=True, num_workers=2, shuffle=False)
 
     model = OptimizedMusicRNN(hidden_size=hyperparameters['hidden_size'], num_layers=hyperparameters['num_layers']).cuda(gpu)
@@ -357,6 +388,7 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
         best_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(hyperparameters['epochs']):
+        epoch_start_time = time.time()  # CHANGE: per-epoch wall-clock timing
         train_sampler.set_epoch(epoch)
         model.train()
         running_loss = 0.0
@@ -401,8 +433,12 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
 
         scheduler.step()
 
+        epoch_seconds = time.time() - epoch_start_time  # CHANGE: measure this rank's epoch time
         if is_main_process:
-            print(f"Epoch [{epoch+1}/{hyperparameters['epochs']}] -> Train Loss: {global_train_loss:.4f}, Val Loss: {global_val_loss:.4f}")
+            # CHANGE: GPU peak memory tells you how much headroom you have on the T4
+            # (16GB) — useful for judging whether batch_size_per_gpu can go higher.
+            gpu_mem_gb = torch.cuda.max_memory_allocated(gpu) / (1024 ** 3)
+            print(f"Epoch [{epoch+1}/{hyperparameters['epochs']}] -> Train Loss: {global_train_loss:.4f}, Val Loss: {global_val_loss:.4f}, Epoch time: {epoch_seconds:.1f}s, GPU peak mem: {gpu_mem_gb:.2f} GB")
 
             if global_val_loss < best_val_loss:
                 best_val_loss = global_val_loss
@@ -442,27 +478,37 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
 
 
 if __name__ == '__main__':
-    # CHANGE: 'all' now trains on every year available in MAESTRO v3, instead of a
-    # hardcoded 5-year subset. Set back to an explicit list (e.g. the original
-    # ['2004','2008','2011','2015','2018']) if you want to control data volume directly.
+    # 'all' auto-discovers every year available in MAESTRO v3; how many actually get
+    # used is capped by hparams['max_years'] below, so you don't need to hardcode or
+    # guess exact year folder names to control data volume.
     selected_years_config = 'all'
 
     hparams = {'seq_len': 64,
                'hidden_size': 256,
                'num_layers': 2,
-               'batch_size_per_gpu': 256,
-               'epochs': 70,          # CHANGE: 50 -> 70, so training runs past one more cosine restart
-               'patience': 15,        # CHANGE: 10 -> 15, to tolerate the pre-restart dips
+               # CHANGE: 256 -> 384. Fewer, bigger batches per epoch means fewer Python-loop
+               # and DDP gradient-sync round trips (no NVLink on Kaggle T4x2, so every sync
+               # has real PCIe cost). Watch the new "GPU peak mem" log line each epoch —
+               # pull this back down toward 256 if it creeps close to the T4's 16GB.
+               'batch_size_per_gpu': 384,
+               # CHANGE: 70 -> 25. With ~3-4x more data per epoch than your original run,
+               # each epoch is worth several of the old ones in total gradient updates —
+               # you need fewer passes over it, not more.
+               'epochs': 25,
+               'patience': 8,          # scaled down to match the lower epoch ceiling
                'lr': 1e-3,
                'weight_decay': 1e-4,
                'time_loss_weight': 0.5,
                'label_smoothing': 0.03,
                'seed': 53,
-               # CHANGE: new knobs added below — all default to the "on" fixes discussed,
-               # but are easy to flip off individually for ablation runs.
+               # CHANGE: dialed back from last version. Combining 'all' years with 4
+               # augmentation shifts gave ~8-10x more data than your very first run, held
+               # in RAM TWICE over (once per DDP rank) — almost certainly why you saw
+               # ~45 min/epoch and 28/32GB RAM. This config targets ~3-4x instead.
+               'max_years': 6,                    # caps auto-discovered years (was unlimited via 'all')
                'use_pitch_augmentation': True,
-               'augmentation_shifts': (-4, -2, 2, 4),   # ~5x train data; trim this list if time is tight
-               'pitch_weight_power': -0.5,              # set to 0.0 to disable class weighting (ablation)
+               'augmentation_shifts': (-3, 3),    # 4 shifts -> 2 shifts (~5x -> ~3x train data)
+               'pitch_weight_power': -0.5,        # set to 0.0 to disable class weighting (ablation)
                }
 
     gpus_available = torch.cuda.device_count()
