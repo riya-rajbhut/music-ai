@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data as data
 import torch.distributed as dist
+from torch.amp import autocast, GradScaler  # CHANGE: replaces deprecated torch.cuda.amp.*
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.hub import download_url_to_file
@@ -89,12 +90,17 @@ def resolve_training_years(dataset_root: pathlib.Path, selected_years):
     )
     available_year_names = [year_path.name for year_path in available_year_paths]
 
+    # CHANGE: 'all' (or None) now auto-expands to every year found in the dataset,
+    # instead of being locked to a hardcoded 5-year subset.
+    if selected_years in (None, 'all'):
+        selected_years = available_year_names
+
     unknown_years = [year for year in selected_years if year not in available_year_names]
     if unknown_years:
         raise ValueError(f"Requested years not found in dataset: {unknown_years}.")
 
     resolved_paths = [dataset_root / year for year in selected_years]
-    return resolved_paths, available_year_names
+    return resolved_paths, available_year_names, selected_years
 
 def compute_time_feature_stats(song_note_arrays):
     logged_time_features = []
@@ -183,7 +189,36 @@ def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
         [song_note_arrays[i] for i in song_indices[val_cutoff:]]
     )
 
-def build_pitch_class_weights(song_note_arrays, num_pitches=128):
+# CHANGE: new function — pitch-transposition augmentation.
+# For each training song, adds transposed copies (shifted by a few semitones).
+# Relative intervals/patterns are preserved, so this gives the model more distinct
+# pitch sequences to learn from without downloading any new data.
+# Only ever applied to the TRAIN split — val/test must stay untouched so evaluation
+# reflects the real data distribution.
+def augment_with_pitch_transposition(song_note_arrays, semitone_shifts=(-4, -2, 2, 4)):
+    augmented = list(song_note_arrays)  # keep all originals
+    for song_notes in song_note_arrays:
+        notes_array = np.asarray(song_notes, dtype=np.float32)
+        if notes_array.size == 0:
+            continue
+        pitches = notes_array[:, 0]
+        min_pitch, max_pitch = pitches.min(), pitches.max()
+        for shift in semitone_shifts:
+            # Skip shifts that would push any note outside the valid MIDI pitch range.
+            if min_pitch + shift < 0 or max_pitch + shift > 127:
+                continue
+            shifted = notes_array.copy()
+            shifted[:, 0] = shifted[:, 0] + shift
+            augmented.append(shifted)
+    return augmented
+
+# CHANGE: added `power` parameter so the class-weighting strength is tunable/disable-able
+# for the accuracy-vs-balance ablation discussed earlier. power=0.0 disables weighting
+# entirely (returns None, so CrossEntropyLoss falls back to unweighted).
+def build_pitch_class_weights(song_note_arrays, num_pitches=128, power=-0.5):
+    if power == 0.0:
+        return None
+
     pitch_counts = np.zeros(num_pitches, dtype=np.float32)
     for song_notes in song_note_arrays:
         pitches = np.asarray(song_notes)[:, 0].astype(np.int64)
@@ -191,7 +226,7 @@ def build_pitch_class_weights(song_note_arrays, num_pitches=128):
 
     observed = pitch_counts > 0
     pitch_weights = np.zeros(num_pitches, dtype=np.float32)
-    pitch_weights[observed] = np.power(pitch_counts[observed], -0.5)
+    pitch_weights[observed] = np.power(pitch_counts[observed], power)
     pitch_weights[observed] /= pitch_weights[observed].mean()
     return torch.tensor(pitch_weights, dtype=torch.float32)
 
@@ -268,16 +303,31 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
         download_maestro_dataset()
     dist.barrier()
 
-    selected_year_paths, _ = resolve_training_years(dataset_root, selected_years)
-    cache_tag = build_cache_tag(selected_years)
+    # CHANGE: resolve_training_years now also returns the resolved year list (in case
+    # 'all' was passed), so the cache tag and logs reflect what was actually used.
+    selected_year_paths, _, resolved_years = resolve_training_years(dataset_root, selected_years)
+    cache_tag = build_cache_tag(resolved_years)
     converted_notes_array = load_or_create_note_cache(selected_year_paths, dataset_root, cache_tag, is_main_process)
 
     train_notes, val_notes, test_notes = split_song_arrays(converted_notes_array, seed=hyperparameters['seed'])
+
+    # CHANGE: pitch-transposition augmentation, train split only.
+    if hyperparameters.get('use_pitch_augmentation', False):
+        train_notes = augment_with_pitch_transposition(
+            train_notes, semitone_shifts=hyperparameters.get('augmentation_shifts', (-4, -2, 2, 4))
+        )
+
     time_feature_mean, time_feature_std = compute_time_feature_stats(train_notes)
 
     train_dataset = BasicRNNForMusic(train_notes, seq_len=hyperparameters['seq_len'], time_feature_mean=time_feature_mean, time_feature_std=time_feature_std)
     val_dataset = BasicRNNForMusic(val_notes, seq_len=hyperparameters['seq_len'], time_feature_mean=time_feature_mean, time_feature_std=time_feature_std)
     test_dataset = BasicRNNForMusic(test_notes, seq_len=hyperparameters['seq_len'], time_feature_mean=time_feature_mean, time_feature_std=time_feature_std)
+
+    # CHANGE: visibility into how much data augmentation + more years actually produced,
+    # so you can gauge per-epoch time before committing to all 70 epochs.
+    if is_main_process:
+        print(f"Years used: {resolved_years}")
+        print(f"Train examples: {len(train_dataset)}, Val examples: {len(val_dataset)}, Test examples: {len(test_dataset)}")
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
@@ -289,13 +339,16 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
     model = OptimizedMusicRNN(hidden_size=hyperparameters['hidden_size'], num_layers=hyperparameters['num_layers']).cuda(gpu)
     model = DDP(model, device_ids=[gpu])
 
-    pitch_class_weights = build_pitch_class_weights(train_notes).cuda(gpu)
-    criterion_pitch = nn.CrossEntropyLoss(weight=pitch_class_weights, label_smoothing=hyperparameters['label_smoothing'])
+    # CHANGE: power is now read from hyperparameters, so the class-weighting ablation
+    # (power=0.0 to disable) can be run without editing this function.
+    pitch_class_weights = build_pitch_class_weights(train_notes, power=hyperparameters.get('pitch_weight_power', -0.5))
+    weight_tensor = pitch_class_weights.cuda(gpu) if pitch_class_weights is not None else None
+    criterion_pitch = nn.CrossEntropyLoss(weight=weight_tensor, label_smoothing=hyperparameters['label_smoothing'])
     criterion_time = nn.SmoothL1Loss()
 
     optimizer = optim.AdamW(model.parameters(), lr=hyperparameters['lr'], weight_decay=hyperparameters['weight_decay'])
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-5)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = GradScaler('cuda')  # CHANGE: torch.cuda.amp.GradScaler() -> torch.amp.GradScaler('cuda')
 
     best_val_loss = float('inf')
     epochs_without_improvement = 0
@@ -313,7 +366,7 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
             y_pitch, y_time = targets[0].cuda(gpu, non_blocking=True), targets[1].cuda(gpu, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast():
+            with autocast('cuda'):  # CHANGE: torch.cuda.amp.autocast() -> torch.amp.autocast('cuda')
                 predictions = model(x_pitch, x_time)
                 loss_pitch = criterion_pitch(predictions['pitch'], y_pitch)
                 loss_step = criterion_time(predictions['step'], y_time[:, 0:1])
@@ -333,7 +386,7 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
             for inputs, targets in val_loader:
                 x_pitch, x_time = inputs[0].cuda(gpu, non_blocking=True), inputs[1].cuda(gpu, non_blocking=True)
                 y_pitch, y_time = targets[0].cuda(gpu, non_blocking=True), targets[1].cuda(gpu, non_blocking=True)
-                with torch.cuda.amp.autocast():
+                with autocast('cuda'):
                     preds = model(x_pitch, x_time)
                     loss_pitch = criterion_pitch(preds['pitch'], y_pitch)
                     loss_step = criterion_time(preds['step'], y_time[:, 0:1])
@@ -375,31 +428,42 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
             for inputs, targets in test_loader:
                 x_pitch, x_time = inputs[0].cuda(0, non_blocking=True), inputs[1].cuda(0, non_blocking=True)
                 y_pitch = targets[0].cuda(0, non_blocking=True)
-                with torch.cuda.amp.autocast():
+                with autocast('cuda'):
                     preds = model.module(x_pitch, x_time)
                     predicted_classes = torch.argmax(preds['pitch'], dim=1)
                     correct_pitch += (predicted_classes == y_pitch).sum().item()
                     total_samples += y_pitch.size(0)
 
         if total_samples > 0:
-            print(f"Final Pitch Accuracy over 5-Year Configuration: {(correct_pitch / total_samples) * 100:.2f}%")
+            # CHANGE: label reflects the actual years used instead of a hardcoded "5-Year".
+            print(f"Final Pitch Accuracy over {cache_tag} Configuration: {(correct_pitch / total_samples) * 100:.2f}%")
 
     dist.destroy_process_group()
 
 
 if __name__ == '__main__':
-    selected_years_config = ['2004', '2008', '2011', '2015', '2018']
+    # CHANGE: 'all' now trains on every year available in MAESTRO v3, instead of a
+    # hardcoded 5-year subset. Set back to an explicit list (e.g. the original
+    # ['2004','2008','2011','2015','2018']) if you want to control data volume directly.
+    selected_years_config = 'all'
+
     hparams = {'seq_len': 64,
                'hidden_size': 256,
                'num_layers': 2,
                'batch_size_per_gpu': 256,
-               'epochs': 50,
-               'patience': 10,
+               'epochs': 70,          # CHANGE: 50 -> 70, so training runs past one more cosine restart
+               'patience': 15,        # CHANGE: 10 -> 15, to tolerate the pre-restart dips
                'lr': 1e-3,
                'weight_decay': 1e-4,
                'time_loss_weight': 0.5,
                'label_smoothing': 0.03,
-               'seed': 53}
+               'seed': 53,
+               # CHANGE: new knobs added below — all default to the "on" fixes discussed,
+               # but are easy to flip off individually for ablation runs.
+               'use_pitch_augmentation': True,
+               'augmentation_shifts': (-4, -2, 2, 4),   # ~5x train data; trim this list if time is tight
+               'pitch_weight_power': -0.5,              # set to 0.0 to disable class weighting (ablation)
+               }
 
     gpus_available = torch.cuda.device_count()
     os.environ['MASTER_ADDR'] = 'localhost'
