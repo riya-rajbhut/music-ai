@@ -312,6 +312,9 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
     rank = gpu
     dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
     torch.cuda.set_device(gpu)
+    # CHANGE: input shapes are fixed every step (fixed seq_len, drop_last=True on train),
+    # so cudnn can safely cache the fastest kernel algorithms instead of re-searching.
+    torch.backends.cudnn.benchmark = True
     is_main_process = (rank == 0)
 
     dataset_root = pathlib.Path('data/maestro-v3.0.0')
@@ -378,7 +381,22 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
     criterion_time = nn.SmoothL1Loss()
 
     optimizer = optim.AdamW(model.parameters(), lr=hyperparameters['lr'], weight_decay=hyperparameters['weight_decay'])
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-5)
+    # CHANGE: CosineAnnealingWarmRestarts(T_0=10) -> warmup + single CosineAnnealingLR.
+    # The old scheduler forced the LR back up to its max every 10 epochs (a "warm
+    # restart"). In your last run that hit right at epoch 11, spiking train/val loss
+    # right after your best checkpoint (epoch 10) — and since `epochs_without_improvement`
+    # counts against that same best, the restart was actively racing your patience=8
+    # early stopping and would very likely have triggered a stop before the new cosine
+    # cycle recovered. A short warmup + one smooth decay over the full run plays much
+    # better with patience-based early stopping in a fixed, short epoch budget like this.
+    warmup_epochs = hyperparameters.get('warmup_epochs', 0)
+    warmup_scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=max(warmup_epochs, 1))
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(hyperparameters['epochs'] - warmup_epochs, 1), eta_min=1e-5
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs]
+    )
     scaler = GradScaler('cuda')  # CHANGE: torch.cuda.amp.GradScaler() -> torch.amp.GradScaler('cuda')
 
     best_val_loss = float('inf')
@@ -486,17 +504,23 @@ if __name__ == '__main__':
     hparams = {'seq_len': 64,
                'hidden_size': 256,
                'num_layers': 2,
-               # CHANGE: 256 -> 384. Fewer, bigger batches per epoch means fewer Python-loop
-               # and DDP gradient-sync round trips (no NVLink on Kaggle T4x2, so every sync
-               # has real PCIe cost). Watch the new "GPU peak mem" log line each epoch —
-               # pull this back down toward 256 if it creeps close to the T4's 16GB.
-               'batch_size_per_gpu': 384,
+               # CHANGE: 384 -> 1536. Your last run showed GPU peak mem at only 0.33GB out
+               # of the T4's 16GB — the GPU was almost idle, and with no NVLink on Kaggle
+               # T4x2 every DDP gradient sync pays real PCIe cost, so *step count* (not
+               # compute) was driving your ~310s/epoch. This ~4x batch bump cuts the number
+               # of steps (and syncs) per epoch by ~4x. Watch "GPU peak mem" in the epoch
+               # log — push this higher still if it stays well under 16GB.
+               'batch_size_per_gpu': 1536,
                # CHANGE: 70 -> 25. With ~3-4x more data per epoch than your original run,
                # each epoch is worth several of the old ones in total gradient updates —
                # you need fewer passes over it, not more.
                'epochs': 25,
                'patience': 8,          # scaled down to match the lower epoch ceiling
-               'lr': 1e-3,
+               # CHANGE: 1e-3 -> 2e-3. sqrt-scaling (common for Adam-family optimizers) to
+               # match the 4x batch_size_per_gpu increase: sqrt(1536/384) = 2x.
+               'lr': 2e-3,
+               'warmup_epochs': 2,     # CHANGE: brief linear warmup so the larger LR+batch
+                                       # combo doesn't destabilize the first few steps.
                'weight_decay': 1e-4,
                'time_loss_weight': 0.5,
                'label_smoothing': 0.03,
