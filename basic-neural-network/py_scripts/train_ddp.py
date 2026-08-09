@@ -296,10 +296,16 @@ class OptimizedMusicRNN(nn.Module):
         lstm_out, (h_n, c_n) = self.lstm(x)
         last_out = self.dropout(h_n[-1])
 
+        # CHANGE: removed F.softplus on step/duration. Targets are log1p'd then z-score
+        # normalized (mean-centered), so ~half the targets are negative — softplus's
+        # (0, inf) output range made those targets structurally unreachable regardless of
+        # training quality. Raw linear output can match the normalized target space;
+        # non-negativity gets enforced at generation time when inverse-transforming back
+        # to real seconds (expm1(pred*std + mean), clip at 0 there if needed), not here.
         return {
             'pitch': self.pitch_head(last_out),
-            'step': F.softplus(self.step_head(last_out)),
-            'duration': F.softplus(self.duration_head(last_out)),
+            'step': self.step_head(last_out),
+            'duration': self.duration_head(last_out),
         }
 
 
@@ -339,6 +345,25 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
         )
 
     time_feature_mean, time_feature_std = compute_time_feature_stats(train_notes)
+
+    # CHANGE: diagnostic logging to show exactly where negative values enter the
+    # step/duration pipeline. Raw MAESTRO step/duration should be >=0 (notes are sorted
+    # by start time before step is computed, and note.end > note.start by construction) —
+    # this print confirms that directly rather than assuming it, then shows how log1p
+    # (still non-negative) and z-score normalization (mean-centered, so ~half the values
+    # land below 0) change the picture at each stage.
+    if is_main_process:
+        raw_time = np.vstack([np.asarray(s, dtype=np.float32)[:, 1:3] for s in train_notes if len(s) > 0])
+        log_time = np.log1p(raw_time)
+        norm_time = (log_time - time_feature_mean) / time_feature_std
+        for i, feat_name in enumerate(['step', 'duration']):
+            raw_col, log_col, norm_col = raw_time[:, i], log_time[:, i], norm_time[:, i]
+            print(f"[time feature diagnostics] {feat_name}: "
+                  f"raw min={raw_col.min():.4f} max={raw_col.max():.4f} mean={raw_col.mean():.4f} "
+                  f"negative_count={(raw_col < 0).sum()} | "
+                  f"log1p min={log_col.min():.4f} max={log_col.max():.4f} mean={log_col.mean():.4f} | "
+                  f"normalized min={norm_col.min():.4f} max={norm_col.max():.4f} mean={norm_col.mean():.4f} "
+                  f"pct_negative={100.0 * (norm_col < 0).mean():.1f}%")
 
     train_dataset = BasicRNNForMusic(train_notes, seq_len=hyperparameters['seq_len'], time_feature_mean=time_feature_mean, time_feature_std=time_feature_std)
     val_dataset = BasicRNNForMusic(val_notes, seq_len=hyperparameters['seq_len'], time_feature_mean=time_feature_mean, time_feature_std=time_feature_std)
@@ -401,7 +426,13 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
 
     best_val_loss = float('inf')
     epochs_without_improvement = 0
-    best_checkpoint_path = pathlib.Path('artifacts') / f'ddp_lstm_music_best_{cache_tag}.pt'
+    # CHANGE: filename now includes hidden_size/num_layers, not just cache_tag (years).
+    # Every experiment so far (hidden_size 256/384/512, num_layers 2/3) shared the same
+    # years and therefore the same filename — each run silently overwrote the previous
+    # one's saved checkpoint. This keeps future experiments' checkpoints separate so you
+    # can reload an old config to compare without retraining it.
+    arch_tag = f"h{hyperparameters['hidden_size']}_l{hyperparameters['num_layers']}"
+    best_checkpoint_path = pathlib.Path('artifacts') / f'ddp_lstm_music_best_{cache_tag}_{arch_tag}.pt'
     if is_main_process:
         best_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -432,6 +463,14 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
 
         model.eval()
         running_val_loss = 0.0
+        # CHANGE: track pitch-only val loss separately from the combined multi-task loss.
+        # Your eval metric is pitch accuracy alone, but the combined loss also includes
+        # step/duration (timing) loss weighted at 0.5 — a model can improve a lot on
+        # timing while pitch barely moves or regresses, and the combined number won't
+        # show you that split. This surfaced directly: hidden_size=512 dropped combined
+        # val loss substantially (2.4836->2.3092) but test pitch accuracy fell
+        # (43.38%->41.51%), which combined loss alone gave no warning of.
+        running_val_loss_pitch = 0.0
         with torch.no_grad():
             for inputs, targets in val_loader:
                 x_pitch, x_time = inputs[0].cuda(gpu, non_blocking=True), inputs[1].cuda(gpu, non_blocking=True)
@@ -443,11 +482,13 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
                     loss_duration = criterion_time(preds['duration'], y_time[:, 1:2])
                     val_loss = loss_pitch + hyperparameters['time_loss_weight'] * (loss_step + loss_duration)
                     running_val_loss += val_loss.item()
+                    running_val_loss_pitch += loss_pitch.item()
 
-        metrics_tensor = torch.tensor([running_loss / len(train_loader), running_val_loss / len(val_loader)], device=gpu)
+        metrics_tensor = torch.tensor([running_loss / len(train_loader), running_val_loss / len(val_loader), running_val_loss_pitch / len(val_loader)], device=gpu)
         dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
         global_train_loss = metrics_tensor[0].item() / world_size
         global_val_loss = metrics_tensor[1].item() / world_size
+        global_val_loss_pitch = metrics_tensor[2].item() / world_size
 
         scheduler.step()
 
@@ -456,10 +497,12 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
             # CHANGE: GPU peak memory tells you how much headroom you have on the T4
             # (16GB) — useful for judging whether batch_size_per_gpu can go higher.
             gpu_mem_gb = torch.cuda.max_memory_allocated(gpu) / (1024 ** 3)
-            print(f"Epoch [{epoch+1}/{hyperparameters['epochs']}] -> Train Loss: {global_train_loss:.4f}, Val Loss: {global_val_loss:.4f}, Epoch time: {epoch_seconds:.1f}s, GPU peak mem: {gpu_mem_gb:.2f} GB")
+            print(f"Epoch [{epoch+1}/{hyperparameters['epochs']}] -> Train Loss: {global_train_loss:.4f}, Val Loss: {global_val_loss:.4f} (Pitch: {global_val_loss_pitch:.4f}), Epoch time: {epoch_seconds:.1f}s, GPU peak mem: {gpu_mem_gb:.2f} GB")
 
-            if global_val_loss < best_val_loss:
-                best_val_loss = global_val_loss
+            # CHANGE: checkpoint selection and early stopping now key off pitch-only val
+            # loss, not the combined loss — matches what the eval pipeline actually scores.
+            if global_val_loss_pitch < best_val_loss:
+                best_val_loss = global_val_loss_pitch
                 epochs_without_improvement = 0
                 torch.save({'model_state_dict': model.module.state_dict(), 'val_loss': best_val_loss}, best_checkpoint_path)
             else:
@@ -478,19 +521,39 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
 
         correct_pitch = 0
         total_samples = 0
+        # CHANGE: track timing quality (step/duration MAE) alongside pitch accuracy —
+        # pitch alone doesn't tell you whether generated music will actually sound right;
+        # timing matters just as much.
+        sum_abs_err_step = 0.0
+        sum_abs_err_duration = 0.0
+        time_mean_t = torch.tensor(time_feature_mean, device=0)
+        time_std_t = torch.tensor(time_feature_std, device=0)
         with torch.no_grad():
             for inputs, targets in test_loader:
                 x_pitch, x_time = inputs[0].cuda(0, non_blocking=True), inputs[1].cuda(0, non_blocking=True)
                 y_pitch = targets[0].cuda(0, non_blocking=True)
+                y_time = targets[1].cuda(0, non_blocking=True)
                 with autocast('cuda'):
                     preds = model.module(x_pitch, x_time)
                     predicted_classes = torch.argmax(preds['pitch'], dim=1)
                     correct_pitch += (predicted_classes == y_pitch).sum().item()
                     total_samples += y_pitch.size(0)
 
+                    # CHANGE: inverse-transform predictions & targets back to real seconds
+                    # (undo z-score, then undo log1p via expm1) so MAE is in units you can
+                    # actually reason about, not normalized-space units.
+                    pred_step_sec = torch.expm1(preds['step'].squeeze(-1) * time_std_t[0] + time_mean_t[0])
+                    pred_duration_sec = torch.expm1(preds['duration'].squeeze(-1) * time_std_t[1] + time_mean_t[1])
+                    true_step_sec = torch.expm1(y_time[:, 0] * time_std_t[0] + time_mean_t[0])
+                    true_duration_sec = torch.expm1(y_time[:, 1] * time_std_t[1] + time_mean_t[1])
+
+                    sum_abs_err_step += (pred_step_sec - true_step_sec).abs().sum().item()
+                    sum_abs_err_duration += (pred_duration_sec - true_duration_sec).abs().sum().item()
+
         if total_samples > 0:
             # CHANGE: label reflects the actual years used instead of a hardcoded "5-Year".
             print(f"Final Pitch Accuracy over {cache_tag} Configuration: {(correct_pitch / total_samples) * 100:.2f}%")
+            print(f"Final Step MAE: {sum_abs_err_step / total_samples:.4f}s, Duration MAE: {sum_abs_err_duration / total_samples:.4f}s")
 
     dist.destroy_process_group()
 
@@ -502,13 +565,19 @@ if __name__ == '__main__':
     selected_years_config = 'all'
 
     hparams = {'seq_len': 64,
-               # CHANGE: 384 -> 512. Last run (hidden_size=384) hit 43.38% test accuracy
-               # with still no overfitting signal (train/val gap narrowed vs the 256 run,
-               # not widened), and GPU mem was only 1.67GB/15GB — capacity doesn't look
-               # maxed out yet. Testing this alone (epochs/pitch_weight_power both held at
-               # their last values) to isolate what more width buys on its own.
-               'hidden_size': 512,
-               'num_layers': 2,
+               # CHANGE: 512 -> 384. The 512 run dropped combined val loss a lot
+               # (2.4836->2.3092) but test pitch accuracy fell (43.38%->41.51%) — the
+               # combined loss improvement wasn't coming from pitch prediction getting
+               # better. 384 is the best-known config by the metric that actually matters
+               # (pitch accuracy), so it's the base for the next test rather than 512.
+               'hidden_size': 384,
+               # CHANGE: 2 -> 3. Testing depth in isolation from the 384 base (not stacked
+               # on 512), per the one-variable-at-a-time plan. Unlike the width increase,
+               # depth adds a genuinely different capability (hierarchical structure across
+               # layers) rather than just more capacity at the same level — and with
+               # checkpoint selection now keyed on pitch-only val loss, this test won't be
+               # muddied by timing-loss improvements the way the 512 run was.
+               'num_layers': 3,
                # CHANGE: 384 -> 1536. Your last run showed GPU peak mem at only 0.33GB out
                # of the T4's 16GB — the GPU was almost idle, and with no NVLink on Kaggle
                # T4x2 every DDP gradient sync pays real PCIe cost, so *step count* (not
