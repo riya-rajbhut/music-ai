@@ -502,7 +502,12 @@ if __name__ == '__main__':
     selected_years_config = 'all'
 
     hparams = {'seq_len': 64,
-               'hidden_size': 256,
+               # CHANGE: 256 -> 384. Last run showed no overfitting (val loss stayed below
+               # train loss with a stable gap) and GPU peak mem was only 1.17GB/16GB —
+               # signs the model has room to learn more than it currently can represent.
+               # This is the main capacity lever, since it doesn't add depth-related
+               # gradient-path risk the way num_layers would.
+               'hidden_size': 384,
                'num_layers': 2,
                # CHANGE: 384 -> 1536. Your last run showed GPU peak mem at only 0.33GB out
                # of the T4's 16GB — the GPU was almost idle, and with no NVLink on Kaggle
@@ -511,10 +516,12 @@ if __name__ == '__main__':
                # of steps (and syncs) per epoch by ~4x. Watch "GPU peak mem" in the epoch
                # log — push this higher still if it stays well under 16GB.
                'batch_size_per_gpu': 1536,
-               # CHANGE: 70 -> 25. With ~3-4x more data per epoch than your original run,
-               # each epoch is worth several of the old ones in total gradient updates —
-               # you need fewer passes over it, not more.
-               'epochs': 25,
+               # CHANGE: 25 -> 40. Last clean run never triggered patience(8) — val loss
+               # was still improving at epoch 25, and the flattening near the end lined up
+               # with the cosine schedule hitting eta_min (T_max is tied to epochs), not a
+               # clear sign of true convergence. T_max recalculates automatically off this
+               # value, so the decay just stretches to match.
+               'epochs': 40,
                'patience': 8,          # scaled down to match the lower epoch ceiling
                # CHANGE: 1e-3 -> 2e-3. sqrt-scaling (common for Adam-family optimizers) to
                # match the 4x batch_size_per_gpu increase: sqrt(1536/384) = 2x.
@@ -532,7 +539,11 @@ if __name__ == '__main__':
                'max_years': 6,                    # caps auto-discovered years (was unlimited via 'all')
                'use_pitch_augmentation': True,
                'augmentation_shifts': (-3, 3),    # 4 shifts -> 2 shifts (~5x -> ~3x train data)
-               'pitch_weight_power': -0.5,        # set to 0.0 to disable class weighting (ablation)
+               # CHANGE: -0.5 -> 0.0. Your eval metric is plain unweighted accuracy, but
+               # -0.5 trains with inverse-frequency weighting that deliberately trades
+               # common-pitch accuracy for rare-pitch balance — working against the metric
+               # you're optimizing for. Disabling it should align training with eval.
+               'pitch_weight_power': 0.0,
                }
 
     gpus_available = torch.cuda.device_count()
