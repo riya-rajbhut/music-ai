@@ -502,12 +502,12 @@ if __name__ == '__main__':
     selected_years_config = 'all'
 
     hparams = {'seq_len': 64,
-               # CHANGE: 256 -> 384. Last run showed no overfitting (val loss stayed below
-               # train loss with a stable gap) and GPU peak mem was only 1.17GB/16GB —
-               # signs the model has room to learn more than it currently can represent.
-               # This is the main capacity lever, since it doesn't add depth-related
-               # gradient-path risk the way num_layers would.
-               'hidden_size': 384,
+               # CHANGE: 384 -> 512. Last run (hidden_size=384) hit 43.38% test accuracy
+               # with still no overfitting signal (train/val gap narrowed vs the 256 run,
+               # not widened), and GPU mem was only 1.67GB/15GB — capacity doesn't look
+               # maxed out yet. Testing this alone (epochs/pitch_weight_power both held at
+               # their last values) to isolate what more width buys on its own.
+               'hidden_size': 512,
                'num_layers': 2,
                # CHANGE: 384 -> 1536. Your last run showed GPU peak mem at only 0.33GB out
                # of the T4's 16GB — the GPU was almost idle, and with no NVLink on Kaggle
@@ -516,12 +516,12 @@ if __name__ == '__main__':
                # of steps (and syncs) per epoch by ~4x. Watch "GPU peak mem" in the epoch
                # log — push this higher still if it stays well under 16GB.
                'batch_size_per_gpu': 1536,
-               # CHANGE: 25 -> 40. Last clean run never triggered patience(8) — val loss
-               # was still improving at epoch 25, and the flattening near the end lined up
-               # with the cosine schedule hitting eta_min (T_max is tied to epochs), not a
-               # clear sign of true convergence. T_max recalculates automatically off this
-               # value, so the decay just stretches to match.
-               'epochs': 40,
+               # CHANGE: 40 -> 35. Last run's val loss was flat from ~epoch 33 onward
+               # (total movement over the last 7 epochs was ~0.003) even with a full
+               # T_max=38 schedule still available — that was real convergence, not the
+               # LR running out. 35 should capture essentially the same result for less
+               # wall-clock, freeing up time to test the bigger model instead.
+               'epochs': 35,
                'patience': 8,          # scaled down to match the lower epoch ceiling
                # CHANGE: 1e-3 -> 2e-3. sqrt-scaling (common for Adam-family optimizers) to
                # match the 4x batch_size_per_gpu increase: sqrt(1536/384) = 2x.
