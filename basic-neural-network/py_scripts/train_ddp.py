@@ -135,6 +135,30 @@ def compute_time_feature_stats(song_note_arrays):
     feature_std = np.where(feature_std < 1e-6, 1.0, feature_std)
     return feature_mean, feature_std
 
+# CHANGE: new — computes upper clip bounds for raw step/duration from percentiles of
+# TRAIN data only (same no-leakage principle as compute_time_feature_stats). Diagnostics
+# on the last run showed normalized step/duration reaching +30 / +17 std devs — a ~49s
+# gap, a ~35s note — values no 64-note local window could predict. This gives a
+# data-derived clip threshold instead of a guessed constant.
+def compute_time_clip_bounds(song_note_arrays, upper_percentile=99.5):
+    raw_time = np.vstack([np.asarray(s, dtype=np.float32)[:, 1:3] for s in song_note_arrays if len(s) > 0])
+    step_max = float(np.percentile(raw_time[:, 0], upper_percentile))
+    duration_max = float(np.percentile(raw_time[:, 1], upper_percentile))
+    return step_max, duration_max
+
+# CHANGE: new — clips raw step/duration to the bounds above, applied identically to all
+# three splits (train bounds, but clipping train/val/test alike, same as normalization).
+# Returns new arrays rather than mutating in place.
+def clip_extreme_time_values(song_note_arrays, step_max, duration_max):
+    clipped = []
+    for song_notes in song_note_arrays:
+        notes_array = np.asarray(song_notes, dtype=np.float32).copy()
+        if notes_array.size > 0:
+            notes_array[:, 1] = np.minimum(notes_array[:, 1], step_max)
+            notes_array[:, 2] = np.minimum(notes_array[:, 2], duration_max)
+        clipped.append(notes_array)
+    return clipped
+
 def load_or_create_note_cache(data_roots, dataset_root: pathlib.Path, cache_tag: str, is_main_process: bool):
     song_cache_file = dataset_root / f'converted_notes_array_{cache_tag}.pkl'
 
@@ -344,15 +368,33 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
             train_notes, semitone_shifts=hyperparameters.get('augmentation_shifts', (-4, -2, 2, 4))
         )
 
+    # CHANGE: clip extreme raw step/duration outliers before they enter normalization or
+    # training. Bounds are the 99.5th percentile of TRAIN data only (no val/test leakage,
+    # same principle as time_feature_mean/std below), then applied identically to all
+    # three splits. Clipping BEFORE compute_time_feature_stats so mean/std themselves
+    # reflect the clipped distribution — otherwise a handful of extreme outliers keep
+    # inflating std and distorting normalization for the other 99.5% of the data too.
+    time_clip_upper_percentile = hyperparameters.get('time_clip_upper_percentile', 99.5)
+    pre_clip_raw_time = np.vstack([np.asarray(s, dtype=np.float32)[:, 1:3] for s in train_notes if len(s) > 0])
+    step_clip_max, duration_clip_max = compute_time_clip_bounds(train_notes, upper_percentile=time_clip_upper_percentile)
+    train_notes = clip_extreme_time_values(train_notes, step_clip_max, duration_clip_max)
+    val_notes = clip_extreme_time_values(val_notes, step_clip_max, duration_clip_max)
+    test_notes = clip_extreme_time_values(test_notes, step_clip_max, duration_clip_max)
+
     time_feature_mean, time_feature_std = compute_time_feature_stats(train_notes)
 
     # CHANGE: diagnostic logging to show exactly where negative values enter the
-    # step/duration pipeline. Raw MAESTRO step/duration should be >=0 (notes are sorted
-    # by start time before step is computed, and note.end > note.start by construction) —
-    # this print confirms that directly rather than assuming it, then shows how log1p
-    # (still non-negative) and z-score normalization (mean-centered, so ~half the values
-    # land below 0) change the picture at each stage.
+    # step/duration pipeline, and now also how much the clip above actually trimmed.
+    # Raw MAESTRO step/duration should be >=0 (notes are sorted by start time before step
+    # is computed, and note.end > note.start by construction) — this print confirms that
+    # directly rather than assuming it, then shows how log1p (still non-negative) and
+    # z-score normalization (mean-centered, so ~half the values land below 0) change the
+    # picture at each stage, all computed POST-clip.
     if is_main_process:
+        print(f"[time clipping] step: clipping raw values above {step_clip_max:.4f}s (p{time_clip_upper_percentile}), "
+              f"{100.0 * (pre_clip_raw_time[:, 0] > step_clip_max).mean():.2f}% of train examples affected | "
+              f"duration: clipping raw values above {duration_clip_max:.4f}s (p{time_clip_upper_percentile}), "
+              f"{100.0 * (pre_clip_raw_time[:, 1] > duration_clip_max).mean():.2f}% of train examples affected")
         raw_time = np.vstack([np.asarray(s, dtype=np.float32)[:, 1:3] for s in train_notes if len(s) > 0])
         log_time = np.log1p(raw_time)
         norm_time = (log_time - time_feature_mean) / time_feature_std
@@ -426,12 +468,12 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
 
     best_val_loss = float('inf')
     epochs_without_improvement = 0
-    # CHANGE: filename now includes hidden_size/num_layers, not just cache_tag (years).
-    # Every experiment so far (hidden_size 256/384/512, num_layers 2/3) shared the same
-    # years and therefore the same filename — each run silently overwrote the previous
-    # one's saved checkpoint. This keeps future experiments' checkpoints separate so you
-    # can reload an old config to compare without retraining it.
-    arch_tag = f"h{hyperparameters['hidden_size']}_l{hyperparameters['num_layers']}"
+    # CHANGE: filename now includes hidden_size/num_layers/augmentation status, not just
+    # cache_tag (years). Every experiment so far shared the same years — and now this run
+    # shares the same architecture (384/3) as the last one too, differing only in
+    # augmentation — so without this it would silently overwrite that checkpoint again.
+    aug_tag = "augT" if hyperparameters.get('use_pitch_augmentation', False) else "augF"
+    arch_tag = f"h{hyperparameters['hidden_size']}_l{hyperparameters['num_layers']}_{aug_tag}"
     best_checkpoint_path = pathlib.Path('artifacts') / f'ddp_lstm_music_best_{cache_tag}_{arch_tag}.pt'
     if is_main_process:
         best_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -441,6 +483,10 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
         train_sampler.set_epoch(epoch)
         model.train()
         running_loss = 0.0
+        # CHANGE: mirror the val-side pitch/combined split on the train side too, so
+        # overfitting checks compare pitch-loss to pitch-loss instead of pitch-loss to a
+        # combined number that includes timing.
+        running_loss_pitch = 0.0
 
         for inputs, targets in train_loader:
             x_pitch, x_time = inputs[0].cuda(gpu, non_blocking=True), inputs[1].cuda(gpu, non_blocking=True)
@@ -460,6 +506,7 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
             scaler.step(optimizer)
             scaler.update()
             running_loss += total_loss.item()
+            running_loss_pitch += loss_pitch.item()
 
         model.eval()
         running_val_loss = 0.0
@@ -484,11 +531,12 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
                     running_val_loss += val_loss.item()
                     running_val_loss_pitch += loss_pitch.item()
 
-        metrics_tensor = torch.tensor([running_loss / len(train_loader), running_val_loss / len(val_loader), running_val_loss_pitch / len(val_loader)], device=gpu)
+        metrics_tensor = torch.tensor([running_loss / len(train_loader), running_loss_pitch / len(train_loader), running_val_loss / len(val_loader), running_val_loss_pitch / len(val_loader)], device=gpu)
         dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
         global_train_loss = metrics_tensor[0].item() / world_size
-        global_val_loss = metrics_tensor[1].item() / world_size
-        global_val_loss_pitch = metrics_tensor[2].item() / world_size
+        global_train_loss_pitch = metrics_tensor[1].item() / world_size
+        global_val_loss = metrics_tensor[2].item() / world_size
+        global_val_loss_pitch = metrics_tensor[3].item() / world_size
 
         scheduler.step()
 
@@ -497,7 +545,7 @@ def main_worker(gpu, world_size, selected_years, hyperparameters):
             # CHANGE: GPU peak memory tells you how much headroom you have on the T4
             # (16GB) — useful for judging whether batch_size_per_gpu can go higher.
             gpu_mem_gb = torch.cuda.max_memory_allocated(gpu) / (1024 ** 3)
-            print(f"Epoch [{epoch+1}/{hyperparameters['epochs']}] -> Train Loss: {global_train_loss:.4f}, Val Loss: {global_val_loss:.4f} (Pitch: {global_val_loss_pitch:.4f}), Epoch time: {epoch_seconds:.1f}s, GPU peak mem: {gpu_mem_gb:.2f} GB")
+            print(f"Epoch [{epoch+1}/{hyperparameters['epochs']}] -> Train Loss: {global_train_loss:.4f} (Pitch: {global_train_loss_pitch:.4f}), Val Loss: {global_val_loss:.4f} (Pitch: {global_val_loss_pitch:.4f}), Epoch time: {epoch_seconds:.1f}s, GPU peak mem: {gpu_mem_gb:.2f} GB")
 
             # CHANGE: checkpoint selection and early stopping now key off pitch-only val
             # loss, not the combined loss — matches what the eval pipeline actually scores.
@@ -606,13 +654,24 @@ if __name__ == '__main__':
                # in RAM TWICE over (once per DDP rank) — almost certainly why you saw
                # ~45 min/epoch and 28/32GB RAM. This config targets ~3-4x instead.
                'max_years': 6,                    # caps auto-discovered years (was unlimited via 'all')
-               'use_pitch_augmentation': True,
-               'augmentation_shifts': (-3, 3),    # 4 shifts -> 2 shifts (~5x -> ~3x train data)
+               # CHANGE: True -> False. Every run so far (256/384/512 hidden, 2/3 layers)
+               # showed no overfitting with augmentation on — testing whether it was doing
+               # real work (val loss should worsen relative to train, and patience(8) will
+               # stop the run on its own if so) or whether the model wasn't close enough to
+               # its capacity ceiling yet for it to matter. Train examples drop to roughly
+               # a third without the 2 extra transposed copies, so epochs should also run
+               # noticeably faster.
+               'use_pitch_augmentation': False,
+               'augmentation_shifts': (-3, 3),    # unused while augmentation is off
                # CHANGE: -0.5 -> 0.0. Your eval metric is plain unweighted accuracy, but
                # -0.5 trains with inverse-frequency weighting that deliberately trades
                # common-pitch accuracy for rare-pitch balance — working against the metric
                # you're optimizing for. Disabling it should align training with eval.
                'pitch_weight_power': 0.0,
+               # CHANGE: new. Clips raw step/duration to this percentile (computed from
+               # train data) before normalization — see [time clipping] log line for the
+               # actual thresholds and % of examples affected each run.
+               'time_clip_upper_percentile': 99.5,
                }
 
     gpus_available = torch.cuda.device_count()
