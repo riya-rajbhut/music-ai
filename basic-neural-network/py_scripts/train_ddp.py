@@ -202,26 +202,50 @@ def load_or_create_note_cache(data_roots, dataset_root: pathlib.Path, cache_tag:
     """Parses every MIDI file into notes once, then reuses the cached result on future runs.
 
     Parsing MIDI is slow; re-doing it every run would waste a lot of time. Only the
-    main process (rank 0) does the parsing — the other GPU process(es) just wait for
-    the cache file to appear, then load it too, so the work only happens once.
+    main process (rank 0) manages the cache file: it checks whether a good one already
+    exists, rebuilds it if it's missing OR unreadable (e.g. left corrupted by an earlier
+    run that crashed mid-write), and only ever gives the file its real name once writing
+    is completely finished. Every other GPU process just waits for a valid file to show
+    up and reads it — they never do the parsing themselves, so the work only happens once.
+
+    Why the temp-file-then-rename step matters: opening a file for writing creates it on
+    disk immediately, before any data is in it. If rank 0 wrote directly to the real
+    filename, another process polling for "does the file exist yet" could see it too
+    early and try to read an empty or half-written file. Renaming a file is atomic on
+    Linux, so the real filename only ever appears once, fully written — there's no
+    in-between state for another process to catch it in.
     """
     song_cache_file = dataset_root / f'converted_notes_array_{cache_tag}.pkl'
 
-    if song_cache_file.exists():
-        with song_cache_file.open('rb') as cache_handle:
-            return pickle.load(cache_handle)
-
     if is_main_process:
+        if song_cache_file.exists():
+            try:
+                with song_cache_file.open('rb') as cache_handle:
+                    return pickle.load(cache_handle)
+            except (EOFError, pickle.UnpicklingError):
+                # Left behind by a run that got killed mid-write — not usable, so
+                # rebuild instead of crashing on it.
+                print(f"Cache file {song_cache_file} looks incomplete/corrupted (likely an interrupted earlier run) — rebuilding it.")
+                song_cache_file.unlink()
+
         download_maestro_dataset()
         converted_notes = convert_all_songs_to_notes(data_roots)
-        with song_cache_file.open('wb') as cache_handle:
+        temp_cache_file = song_cache_file.with_name(song_cache_file.name + '.tmp')
+        with temp_cache_file.open('wb') as cache_handle:
             pickle.dump(converted_notes, cache_handle)
+        os.replace(temp_cache_file, song_cache_file)  # atomic — no reader ever sees a partial file
         return converted_notes
     else:
-        while not song_cache_file.exists():
+        # Retry rather than crash on a failed load: rank 0 might still be in the
+        # middle of detecting and deleting a leftover corrupted file above.
+        while True:
+            if song_cache_file.exists():
+                try:
+                    with song_cache_file.open('rb') as cache_handle:
+                        return pickle.load(cache_handle)
+                except (EOFError, pickle.UnpicklingError):
+                    pass
             time.sleep(1)
-        with song_cache_file.open('rb') as cache_handle:
-            return pickle.load(cache_handle)
 
 
 # ==========================================
