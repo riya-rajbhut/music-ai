@@ -21,6 +21,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.hub import download_url_to_file
 
+"""
+Trains an LSTM to predict the next note (pitch, timing-until-it-starts, and how long
+it rings) in a piano performance, using the MAESTRO dataset. Runs across both GPUs on
+a Kaggle T4x2 machine using PyTorch's DistributedDataParallel (DDP): this script's
+main_worker() function runs once per GPU, each on its own slice of the data, syncing
+gradients after every batch so both GPUs end up training the same model together.
+
+Pipeline: download & parse MIDI -> clip/normalize timing features -> split into
+train/val/test by song -> (optionally) augment the train set -> train an LSTM with
+three prediction heads (pitch / step / duration) -> evaluate on held-out test songs.
+"""
 
 # ==========================================
 # 1. DATASET DOWNLOADING & PREPROCESSING
@@ -113,7 +124,13 @@ def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool)
 
 
 def compute_time_clip_bounds(song_note_arrays, upper_percentile=99.5):
-    """Calculates percentile upper bounds for step and duration."""
+    """Finds a cutoff for unusually long step/duration values (e.g. 99.5th percentile).
+
+    A tiny fraction of notes have huge gaps before them (the performer paused) or ring
+    for a very long time — outliers a 64-note window has no way to predict. Left alone,
+    these outliers also distort the mean/std used for normalization above. We find the
+    cutoff from TRAIN data only, then apply it everywhere (see clip_extreme_time_values).
+    """
     raw_time = np.vstack([np.asarray(s, dtype=np.float32)[:, 1:3] for s in song_note_arrays if len(s) > 0])
     step_max = float(np.percentile(raw_time[:, 0], upper_percentile))
     duration_max = float(np.percentile(raw_time[:, 1], upper_percentile))
@@ -204,8 +221,17 @@ def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
 # ==========================================
 
 class OptimizedMusicRNN(nn.Module):
-    """LSTM model with prediction heads for pitch, step, and duration."""
+    """Predicts (pitch, step, duration) for the next note, given the past `seq_len` notes.
 
+    pitch_embedding: turns each pitch (0-127, a category) into a learned vector, so the
+        model can learn how pitches relate to each other instead of treating pitch as
+        a plain number.
+    lstm: reads the sequence one note at a time, carrying a "memory" (hidden state)
+        forward so later predictions can be informed by earlier notes.
+    pitch/step/duration heads: small networks that turn the LSTM's final memory state
+        into the three predictions. pitch is classification (128 possible notes);
+        step/duration are regression (real-valued numbers in normalized space).
+    """
     def __init__(self, num_pitches=128, pitch_embed_dim=128, hidden_size=256, num_layers=2, dropout_rate=0.3):
         super().__init__()
 
@@ -259,6 +285,16 @@ class OptimizedMusicRNN(nn.Module):
 # ==========================================
 
 def main_worker(gpu, world_size, hparams):
+
+    """Everything one GPU process does: load data, build the model, train, evaluate.
+
+    Because we're training on 2 GPUs, this exact function runs TWICE at the same time
+    — once per GPU — each with a different `gpu` number (0 or 1). PyTorch's
+    DistributedDataParallel (DDP) keeps both copies of the model in sync: after every
+    batch, gradients computed on each GPU are averaged together (all-reduce) so both
+    GPUs are always training the same model, just splitting the work of going through
+    the data in half.
+    """
     rank = gpu
     dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
     torch.cuda.set_device(gpu)
@@ -304,6 +340,9 @@ def main_worker(gpu, world_size, hparams):
 
     optimizer = optim.AdamW(model.parameters(), lr=hparams['lr'], weight_decay=hparams['weight_decay'])
 
+    # Learning-rate schedule: a short linear warmup (so a high LR doesn't destabilize the
+    # very first few steps), followed by one smooth cosine decay down to eta_min over the
+    # rest of training.
     warmup_epochs = hparams['warmup_epochs']
     warmup_scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=max(warmup_epochs, 1))
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(hparams['epochs'] - warmup_epochs, 1), eta_min=1e-5)
@@ -361,7 +400,8 @@ def main_worker(gpu, world_size, hparams):
                     val_loss_tot += val_loss.item()
                     val_loss_p += loss_pitch.item()
 
-        # Synchronize metrics across GPUs
+        # Average each metric across both GPUs, so the printed numbers reflect the
+        # whole dataset, not just whatever half this one GPU happened to process.
         metrics = torch.tensor([
             running_loss / len(train_loader), running_pitch_loss / len(train_loader),
             val_loss_tot / len(val_loader), val_loss_p / len(val_loader)
