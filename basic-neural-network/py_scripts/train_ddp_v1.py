@@ -1,154 +1,180 @@
+"""
+A minimal LSTM that learns to predict the next note in a piece of music.
+
+This is deliberately simplified for learning, not for accuracy. Every line
+here has a clear job, and there's nothing extra to explain away. Given the
+last SEQ_LEN notes played, the model predicts what note comes next - the
+exact same idea as "given the last few words, predict the next word."
+
+To keep things fast and easy to follow, this only uses a handful of songs
+and trains for a few epochs. Don't expect a great model - expect one you
+can read from top to bottom and understand.
+"""
+
 import pathlib
 import zipfile
+
 import pretty_midi as pm
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
 from torch.hub import download_url_to_file
+from torch.utils.data import Dataset, DataLoader
 
-# ==========================================
-# 1. DATASET DOWNLOADING & MIDI PARSING
-# ==========================================
-def download_sample_data():
-    """Downloads the MAESTRO dataset zip if you don't have it."""
+# --- Settings you can play with ---
+MAX_SONGS = 50        # fewer songs = faster to run, but a worse model
+SEQ_LEN = 32           # how many past notes the model gets to look at
+HIDDEN_SIZE = 128      # size of the LSTM's internal memory
+EPOCHS = 5
+BATCH_SIZE = 64
+LEARNING_RATE = 1e-3
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+# ======================================================================
+# Step 1: Get some real piano music to learn from
+# ======================================================================
+
+def download_maestro():
+    """Downloads and unzips a public dataset of piano performances (MIDI files)."""
     url = "https://storage.googleapis.com/magentadata/datasets/maestro/v3.0.0/maestro-v3.0.0-midi.zip"
-    zip_path = pathlib.Path("maestro.zip")
-    extract_path = pathlib.Path("maestro_data")
-    
-    if not extract_path.exists():
-        print("Downloading MAESTRO dataset sample...")
-        download_url_to_file(url, str(zip_path), progress=True)
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_path)
-            
-    # Find the first .midi file in the extracted folder
-    midi_files = list(extract_path.glob("**/*.midi"))
-    return midi_files[0]
+    data_dir = pathlib.Path('data')
+    data_dir.mkdir(exist_ok=True)
+    zip_path = data_dir / 'maestro.zip'
+    extracted_path = data_dir / 'maestro-v3.0.0'
+
+    if not extracted_path.exists():
+        print("Downloading MAESTRO dataset (piano performances)...")
+        download_url_to_file(url, str(zip_path))
+        with zipfile.ZipFile(zip_path, 'r') as zip_file:
+            zip_file.extractall(data_dir)
+
+    return extracted_path
 
 
-def load_midi_notes(midi_file_path):
-    """Reads a MIDI file and returns a tensor of [pitch, step, duration] notes."""
-    midi_data = pm.PrettyMIDI(str(midi_file_path))
-    instrument = midi_data.instruments[0]  # Grab the piano track
-    
-    # Sort notes by when they start playing
-    sorted_notes = sorted(instrument.notes, key=lambda note: note.start)
-    
-    notes_list = []
-    prev_start_time = 0.0
-    
-    for note in sorted_notes:
-        pitch = float(note.pitch)                  # MIDI note (0 to 127)
-        step = float(note.start - prev_start_time) # Wait time before this note starts
-        duration = float(note.end - note.start)    # How long the note rings
-        
-        notes_list.append([pitch, step, duration])
-        prev_start_time = note.start
-        
-    return torch.tensor(notes_list, dtype=torch.float32)
+def midi_file_to_pitches(midi_path):
+    """Turns one MIDI file into a plain list of note pitches (0-127), in the order played."""
+    midi_data = pm.PrettyMIDI(str(midi_path))
+    if not midi_data.instruments:
+        return []
+    notes_in_order = sorted(midi_data.instruments[0].notes, key=lambda note: note.start)
+    return [note.pitch for note in notes_in_order]
 
 
-# ==========================================
-# 2. SLIDING WINDOW PYTORCH DATASET
-# ==========================================
-class SimpleMusicDataset(Dataset):
-    """Turns a list of notes into 10-note sequences that predict the 11th note."""
-    def __init__(self, notes_tensor, seq_len=10):
-        self.inputs = []
-        self.targets = []
-        
-        # Slide a window across the song notes
-        for i in range(len(notes_tensor) - seq_len):
-            # Input: Past `seq_len` notes (e.g., notes 0 to 9)
-            self.inputs.append(notes_tensor[i : i + seq_len])
-            # Target: Next note to predict (e.g., note 10)
-            self.targets.append(notes_tensor[i + seq_len])
+# ======================================================================
+# Step 2: Turn songs into (past notes -> next note) training examples
+# ======================================================================
+
+class NoteDataset(Dataset):
+    """
+    Each training example is SEQ_LEN notes in a row, plus the note that comes
+    right after them. The model's whole job is to predict that next note from
+    the notes before it.
+    """
+
+    def __init__(self, songs, seq_len):
+        self.examples = []
+        for pitches in songs:
+            for start in range(len(pitches) - seq_len):
+                window = pitches[start:start + seq_len]
+                next_note = pitches[start + seq_len]
+                self.examples.append((window, next_note))
 
     def __len__(self):
-        return len(self.inputs)
+        return len(self.examples)
 
     def __getitem__(self, idx):
-        return self.inputs[idx], self.targets[idx]
+        window, next_note = self.examples[idx]
+        return torch.tensor(window, dtype=torch.long), torch.tensor(next_note, dtype=torch.long)
 
 
-# ==========================================
-# 3. THE SIMPLE LSTM MODEL
-# ==========================================
-class SimpleMusicLSTM(nn.Module):
-    def __init__(self, input_size=3, hidden_size=64, output_size=3):
+# ======================================================================
+# Step 3: The LSTM model itself
+# ======================================================================
+
+class NoteLSTM(nn.Module):
+    """
+    Reads a sequence of note pitches and predicts the pitch of the next note.
+
+    The pipeline is: pitch numbers -> embeddings -> LSTM -> linear layer ->
+    a score for each of the 128 possible next pitches (higher = more likely).
+    """
+
+    def __init__(self, num_pitches=128, embed_dim=32, hidden_size=HIDDEN_SIZE):
         super().__init__()
-        # The LSTM reads a sequence of past notes
-        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, batch_first=True)
-        
-        # A single linear layer converts the LSTM memory into the final note prediction
-        self.fc = nn.Linear(hidden_size, output_size)
+        # Turns each pitch number (0-127) into a small vector of learned features,
+        # instead of treating pitch numbers as if their raw size were meaningful.
+        self.embedding = nn.Embedding(num_pitches, embed_dim)
+        # Reads the sequence of embeddings one note at a time, updating an internal
+        # "memory" (the hidden state) as it goes.
+        self.lstm = nn.LSTM(embed_dim, hidden_size, batch_first=True)
+        # Turns the LSTM's final memory into a score for each possible next pitch.
+        self.output_layer = nn.Linear(hidden_size, num_pitches)
 
-    def forward(self, x):
-        # x shape: (batch_size, sequence_length, input_size)
-        lstm_out, (h_n, c_n) = self.lstm(x)
-        
-        # Take the LSTM's output at the VERY LAST note of the sequence
-        last_note_memory = lstm_out[:, -1, :]
-        
-        # Predict the next note (pitch, step, duration)
-        prediction = self.fc(last_note_memory)
-        return prediction
+    def forward(self, pitch_sequence):
+        embedded = self.embedding(pitch_sequence)             # (batch, seq_len, embed_dim)
+        _, (final_hidden, _) = self.lstm(embedded)             # run the LSTM over the whole sequence
+        return self.output_layer(final_hidden[-1])             # (batch, num_pitches) scores
 
 
-# ==========================================
-# 4. MAIN TRAINING LOOP (REAL DATA)
-# ==========================================
-if __name__ == '__main__':
-    # Hyperparameters
-    seq_len = 10        # Number of past notes the model looks at
-    features = 3       # [Pitch, Step, Duration]
-    batch_size = 16
-    epochs = 5
-    hidden_size = 64
-    learning_rate = 0.001
+# ======================================================================
+# Step 4: Load the data, train the model, see how it did
+# ======================================================================
 
-    # Step 1: Download & get path to a MIDI file
-    sample_midi_path = download_sample_data()
-    print(f"Reading MIDI file: {sample_midi_path.name}")
+def main():
+    data_root = download_maestro()
+    midi_files = list(data_root.glob('**/*.midi'))[:MAX_SONGS]
+    print(f"Using {len(midi_files)} songs")
 
-    # Step 2: Read the real notes out of the MIDI file
-    notes = load_midi_notes(sample_midi_path)
-    print(f"Total notes in song: {len(notes)}")
+    songs = [midi_file_to_pitches(path) for path in midi_files]
+    songs = [notes for notes in songs if len(notes) > SEQ_LEN]  # drop songs too short to learn from
 
-    # Step 3: Package into a PyTorch Dataset & DataLoader
-    dataset = SimpleMusicDataset(notes_tensor=notes, seq_len=seq_len)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    split_point = int(len(songs) * 0.9)
+    train_songs, val_songs = songs[:split_point], songs[split_point:]
 
-    # Step 4: Initialize Model, Loss Function, and Optimizer
-    model = SimpleMusicLSTM(input_size=features, hidden_size=hidden_size, output_size=features)
-    criterion = nn.MSELoss()  # Mean Squared Error
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    train_data = NoteDataset(train_songs, SEQ_LEN)
+    val_data = NoteDataset(val_songs, SEQ_LEN)
+    train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE)
+    print(f"Train examples: {len(train_data)}, Val examples: {len(val_data)}")
 
-    # Step 5: Run Training Loop over real DataLoader batches
-    print("\nStarting Training on Real Data...")
+    model = NoteLSTM().to(device)
+    loss_function = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    for epoch in range(epochs):
-        epoch_loss = 0.0
-        
-        for x_batch, y_batch in dataloader:
-            # 1. Reset gradients from the previous step
+    for epoch in range(EPOCHS):
+        # --- Training: the model learns from the training examples ---
+        model.train()
+        train_loss = 0.0
+        for windows, targets in train_loader:
+            windows, targets = windows.to(device), targets.to(device)
+
             optimizer.zero_grad()
-
-            # 2. Forward Pass: Make predictions
-            predictions = model(x_batch)
-
-            # 3. Calculate Loss: How wrong was the prediction?
-            loss = criterion(predictions, y_batch)
-
-            # 4. Backward Pass: Calculate gradients
+            predictions = model(windows)
+            loss = loss_function(predictions, targets)
             loss.backward()
-
-            # 5. Update Model Weights
             optimizer.step()
 
-            epoch_loss += loss.item()
+            train_loss += loss.item()
 
-        print(f"Epoch {epoch + 1}/{epochs} | Loss: {epoch_loss:.4f}")
+        # --- Validation: just checking how it does on notes it didn't train on ---
+        model.eval()
+        val_loss = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for windows, targets in val_loader:
+                windows, targets = windows.to(device), targets.to(device)
+                predictions = model(windows)
+                val_loss += loss_function(predictions, targets).item()
+                correct += (predictions.argmax(dim=1) == targets).sum().item()
+                total += targets.size(0)
 
-    print("\nTraining Complete!")
+        print(f"Epoch {epoch + 1}/{EPOCHS} - "
+              f"Train Loss: {train_loss / len(train_loader):.4f}, "
+              f"Val Loss: {val_loss / len(val_loader):.4f}, "
+              f"Val Accuracy: {100 * correct / total:.1f}%")
+
+
+if __name__ == '__main__':
+    main()
