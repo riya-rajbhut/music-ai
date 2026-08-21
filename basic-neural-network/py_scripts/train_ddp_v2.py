@@ -335,14 +335,23 @@ def main_worker(gpu, world_size, hparams):
     model = OptimizedMusicRNN(hidden_size=hparams['hidden_size'], num_layers=hparams['num_layers']).cuda(gpu)
     model = DDP(model, device_ids=[gpu])
 
-    ## Cross-entropy loss is for classification like pitch, looks at the probability the model assigned to the correct answer (here, 85% for "7") and asks: how confident and correct was this?
+    ## Cross-entropy loss is for classification like pitch, looks at the probability the model assigned to the correct answer and asks: how confident and correct was this?
     # Loss = −log(probability assigned to the correct class)
     #If the model gives the correct answer a high probability (close to 1, i.e., very confident and correct), −log(p) is close to 0. Almost no penalty — great job.
     #If the model gives the correct answer a low probability (it barely considered it, or was confident in a wrong answer), −log(p) shoots up toward a huge number. Big penalty.
 
+    #For SmoothL1Loss, the loss is a combination of L1 and L2 loss. For small errors (less than 1), it uses L2 loss (squared error), which is smooth and differentiable. F
+    # For larger errors (greater than 1), it switches to L1 loss (absolute error), which is less sensitive to outliers. This makes SmoothL1Loss more robust to outliers compared to pure L2 loss.
+    # Score = distance away (this is basically "L1 loss"). Miss by 2 inches → lose 2 points. Miss by 10 inches → lose 10 points
+    #Score = distance squared (this is "L2 loss"). Miss by 2 inches → lose 4 points. Miss by 10 inches → lose 100 points.
+
     criterion_pitch = nn.CrossEntropyLoss(label_smoothing=hparams['label_smoothing'])
     criterion_time = nn.SmoothL1Loss()
 
+    #Adam looks at momentum (the running average of past gradients) and the variance of the gradients to adaptively adjust the learning rate for each parameter. 
+    # This helps the optimizer converge faster and more reliably, especially in scenarios where the loss landscape is complex or has varying curvature.
+    #AdamW is a variant of the Adam optimizer that decouples weight decay from the gradient update. In standard Adam, weight decay is applied as part of the gradient update, 
+    # which can lead to suboptimal regularization. AdamW applies weight decay directly to the weights after the gradient update, leading to better generalization and performance in many cases.
     optimizer = optim.AdamW(model.parameters(), lr=hparams['lr'], weight_decay=hparams['weight_decay'])
 
     # Learning-rate schedule: a short linear warmup (so a high LR doesn't destabilize the
@@ -482,7 +491,7 @@ if __name__ == '__main__':
         'warmup_epochs': 2,
         'weight_decay': 1e-4,
         'time_loss_weight': 0.5,
-        'label_smoothing': 0.03,
+        'label_smoothing': 0.02,
         'seed': 53,
         'time_clip_upper_percentile': 99.5,
     }
