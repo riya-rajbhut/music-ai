@@ -335,6 +335,11 @@ def main_worker(gpu, world_size, hparams):
     model = OptimizedMusicRNN(hidden_size=hparams['hidden_size'], num_layers=hparams['num_layers']).cuda(gpu)
     model = DDP(model, device_ids=[gpu])
 
+    ## Cross-entropy loss is for classification like pitch, looks at the probability the model assigned to the correct answer (here, 85% for "7") and asks: how confident and correct was this?
+    # Loss = −log(probability assigned to the correct class)
+    #If the model gives the correct answer a high probability (close to 1, i.e., very confident and correct), −log(p) is close to 0. Almost no penalty — great job.
+    #If the model gives the correct answer a low probability (it barely considered it, or was confident in a wrong answer), −log(p) shoots up toward a huge number. Big penalty.
+
     criterion_pitch = nn.CrossEntropyLoss(label_smoothing=hparams['label_smoothing'])
     criterion_time = nn.SmoothL1Loss()
 
@@ -471,7 +476,7 @@ if __name__ == '__main__':
         'hidden_size': 384,
         'num_layers': 3,
         'batch_size_per_gpu': 1536,
-        'epochs': 40,
+        'epochs': 45,
         'patience': 8,
         'lr': 2e-3,
         'warmup_epochs': 2,
