@@ -578,7 +578,7 @@ if __name__ == '__main__':
         'hidden_size': 384,
         'num_layers': 3,
         'batch_size_per_gpu': 1536,
-        'epochs': 50,
+        'epochs': 30,
         'patience': 8,
         'lr': 2e-3,
         'warmup_epochs': 2,
