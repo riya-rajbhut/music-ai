@@ -5,6 +5,7 @@ import collections
 import time
 import warnings
 
+
 warnings.filterwarnings('ignore', message='pkg_resources is deprecated as an API')
 
 import numpy as np
@@ -78,11 +79,17 @@ def convert_midi_to_notes(midi_file_path: str) -> pd.DataFrame:
     return pd.DataFrame({name: np.array(values, dtype=np.float32) for name, values in notes.items()})
 
 
-def convert_all_songs_to_notes(dataset_root: pathlib.Path) -> list:
-    """Parses all .midi files under the root directory into numpy arrays."""
-    all_midi_files = list(dataset_root.glob('**/*.midi'))
+def convert_all_songs_to_notes(dataset_root: pathlib.Path, years_to_use=None) -> list:
+    """Parses .midi files from selected year folders into numpy arrays."""
+    if years_to_use is None:
+        all_midi_files = list(dataset_root.glob('**/*.midi'))
+    else:
+        all_midi_files = []
+        for year in years_to_use:
+            all_midi_files.extend((dataset_root / str(year)).glob('*.midi'))
+
     if not all_midi_files:
-        raise FileNotFoundError(f"No MIDI files found in {dataset_root}")
+        raise FileNotFoundError(f"No MIDI files found in {dataset_root} for years {years_to_use}")
 
     all_songs = []
     for midi_file in all_midi_files:
@@ -93,9 +100,10 @@ def convert_all_songs_to_notes(dataset_root: pathlib.Path) -> list:
     return all_songs
 
 
-def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool) -> list:
+def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool, years_to_use=None) -> list:
     """Handles cached dataset reading and writing for multi-GPU safety."""
-    cache_file = dataset_root / 'converted_notes.pkl'
+    year_tag = "all" if years_to_use is None else "_".join(map(str, years_to_use))
+    cache_file = dataset_root / f'converted_notes_{year_tag}.pkl'
 
     if is_main_process:
         if cache_file.exists():
@@ -106,7 +114,7 @@ def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool)
                 cache_file.unlink()
 
         download_maestro_dataset()
-        converted_notes = convert_all_songs_to_notes(dataset_root)
+        converted_notes = convert_all_songs_to_notes(dataset_root, years_to_use)
         temp_cache = cache_file.with_name('converted_notes.tmp')
         with temp_cache.open('wb') as f:
             pickle.dump(converted_notes, f)
@@ -307,7 +315,7 @@ def main_worker(gpu, world_size, hparams):
         download_maestro_dataset()
     dist.barrier()
 
-    converted_notes = load_or_create_note_cache(dataset_root, is_main_process)
+    converted_notes = load_or_create_note_cache(dataset_root, is_main_process, hparams['years_to_use'])
     train_notes, val_notes, test_notes = split_song_arrays(converted_notes, seed=hparams['seed'])
 
     step_max, duration_max = compute_time_clip_bounds(train_notes, hparams['time_clip_upper_percentile'])
@@ -362,83 +370,168 @@ def main_worker(gpu, world_size, hparams):
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(hparams['epochs'] - warmup_epochs, 1), eta_min=1e-5)
     scheduler = optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
 
-    scaler = GradScaler('cuda')
+    scaler = GradScaler("cuda")
 
-    best_val_pitch_loss = float('inf')
-    epochs_without_improvement = 0
-    best_checkpoint_path = pathlib.Path('artifacts/best_model.pt')
+    artifacts_root = pathlib.Path("artifacts")
+    best_checkpoint_path = artifacts_root / "best_model.pt"
+    history_csv_path = artifacts_root / "history.csv"
     if is_main_process:
-        best_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    best_val_pitch_loss = float("inf")
+    epochs_without_improvement = 0
+    history_rows = []
 
     # --- Training Loop ---
-    for epoch in range(hparams['epochs']):
+    for epoch in range(hparams["epochs"]):
         epoch_start = time.time()
         train_sampler.set_epoch(epoch)
         model.train()
-        running_loss, running_pitch_loss = 0.0, 0.0
 
-        for inputs, targets in train_loader:
-            x_pitch, x_time = inputs[0].cuda(gpu, non_blocking=True), inputs[1].cuda(gpu, non_blocking=True)
-            y_pitch, y_time = targets[0].cuda(gpu, non_blocking=True), targets[1].cuda(gpu, non_blocking=True)
+        running_loss, running_pitch_loss = 0.0, 0.0
+        train_correct, train_total = 0, 0
+
+        for batch_idx, (inputs, targets) in enumerate(train_loader):
+            x_pitch = inputs[0].cuda(gpu, non_blocking=True)
+            x_time = inputs[1].cuda(gpu, non_blocking=True)
+            y_pitch = targets[0].cuda(gpu, non_blocking=True)
+            y_time = targets[1].cuda(gpu, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast('cuda'):
-                preds = model(x_pitch, x_time)
-                loss_pitch = criterion_pitch(preds['pitch'], y_pitch)
-                loss_step = criterion_time(preds['step'], y_time[:, 0:1])
-                loss_duration = criterion_time(preds['duration'], y_time[:, 1:2])
-                total_loss = loss_pitch + hparams['time_loss_weight'] * (loss_step + loss_duration)
 
-            scaler.scale(total_loss).backward()
+            with autocast("cuda"):
+                preds = model(x_pitch, x_time)
+                predicted_pitch = torch.argmax(preds["pitch"], dim=1)
+
+                train_correct += (predicted_pitch == y_pitch).sum().item()
+                train_total += y_pitch.size(0)
+
+                loss_pitch = criterion_pitch(preds["pitch"], y_pitch)
+                loss_step = criterion_time(preds["step"], y_time[:, 0:1])
+                loss_duration = criterion_time(preds["duration"], y_time[:, 1:2])
+                train_loss = loss_pitch + hparams["time_loss_weight"] * (loss_step + loss_duration)
+
+            scaler.scale(train_loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
-            running_loss += total_loss.item()
+            running_loss += train_loss.item()
             running_pitch_loss += loss_pitch.item()
 
         # Evaluation
         model.eval()
         val_loss_tot, val_loss_p = 0.0, 0.0
+        val_correct, val_total = 0, 0
+        debug_rows = []
+
         with torch.no_grad():
             for inputs, targets in val_loader:
-                x_pitch, x_time = inputs[0].cuda(gpu, non_blocking=True), inputs[1].cuda(gpu, non_blocking=True)
-                y_pitch, y_time = targets[0].cuda(gpu, non_blocking=True), targets[1].cuda(gpu, non_blocking=True)
-                with autocast('cuda'):
+                x_pitch = inputs[0].cuda(gpu, non_blocking=True)
+                x_time = inputs[1].cuda(gpu, non_blocking=True)
+                y_pitch = targets[0].cuda(gpu, non_blocking=True)
+                y_time = targets[1].cuda(gpu, non_blocking=True)
+
+                with autocast("cuda"):
                     preds = model(x_pitch, x_time)
-                    loss_pitch = criterion_pitch(preds['pitch'], y_pitch)
-                    loss_step = criterion_time(preds['step'], y_time[:, 0:1])
-                    loss_duration = criterion_time(preds['duration'], y_time[:, 1:2])
-                    val_loss = loss_pitch + hparams['time_loss_weight'] * (loss_step + loss_duration)
+                    predicted_pitch = torch.argmax(preds["pitch"], dim=1)
+
+                    val_correct += (predicted_pitch == y_pitch).sum().item()
+                    val_total += y_pitch.size(0)
+
+                    loss_pitch = criterion_pitch(preds["pitch"], y_pitch)
+                    loss_step = criterion_time(preds["step"], y_time[:, 0:1])
+                    loss_duration = criterion_time(preds["duration"], y_time[:, 1:2])
+                    val_loss = loss_pitch + hparams["time_loss_weight"] * (loss_step + loss_duration)
+
                     val_loss_tot += val_loss.item()
                     val_loss_p += loss_pitch.item()
 
-        # Average each metric across both GPUs, so the printed numbers reflect the
-        # whole dataset, not just whatever half this one GPU happened to process.
-        metrics = torch.tensor([
-            running_loss / len(train_loader), running_pitch_loss / len(train_loader),
-            val_loss_tot / len(val_loader), val_loss_p / len(val_loader)
-        ], device=gpu)
-        dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
-        train_l, train_p_l, val_l, val_p_l = (metrics / world_size).tolist()
+                if is_main_process and len(debug_rows) < 10:
+                    sample_idx = torch.randint(0, y_pitch.size(0), (1,), device=gpu).item()
+                    debug_rows.append({
+                        "epoch": epoch + 1,
+                        "target_pitch": int(y_pitch[sample_idx].item()),
+                        "pred_pitch": int(predicted_pitch[sample_idx].item()),
+                        "input_tail": x_pitch[sample_idx, -10:].detach().cpu().tolist(),
+                    })
 
+        metrics = torch.tensor(
+            [
+                running_loss / len(train_loader),
+                running_pitch_loss / len(train_loader),
+                val_loss_tot / len(val_loader),
+                val_loss_p / len(val_loader),
+                train_correct,
+                train_total,
+                val_correct,
+                val_total,
+            ],
+            device=gpu,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+
+        (
+            train_l,
+            train_p_l,
+            val_l,
+            val_p_l,
+            train_correct_all,
+            train_total_all,
+            val_correct_all,
+            val_total_all,
+        ) = metrics.tolist()
+
+        train_acc = train_correct_all / train_total_all if train_total_all else 0.0
+        val_acc = val_correct_all / val_total_all if val_total_all else 0.0
+
+        current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step()
 
         if is_main_process:
-            print(f"Epoch [{epoch+1}/{hparams['epochs']}] | "
-                  f"Train Loss: {train_l:.4f} (Pitch: {train_p_l:.4f}) | "
-                  f"Val Loss: {val_l:.4f} (Pitch: {val_p_l:.4f}) | "
-                  f"Time: {time.time() - epoch_start:.1f}s")
+            history_rows.append(
+                {
+                    "epoch": epoch + 1,
+                    "lr": current_lr,
+                    "train_loss": train_l,
+                    "train_pitch_loss": train_p_l,
+                    "train_acc": train_acc,
+                    "val_loss": val_l,
+                    "val_pitch_loss": val_p_l,
+                    "val_acc": val_acc,
+                }
+            )
+
+            if (epoch + 1) % 5 == 0 and debug_rows:
+                pd.DataFrame(debug_rows).to_csv(
+                    artifacts_root / f"predictions_epoch_{epoch+1}.csv",
+                    index=False,
+                )
+
+            if (epoch + 1) % 10 == 0:
+                print(
+                    f"Epoch [{epoch+1}/{hparams['epochs']}] | "
+                    f"LR: {current_lr:.6f} | "
+                    f"Train Loss: {train_l:.4f} | Train Acc: {train_acc*100:.2f}% | "
+                    f"Val Loss: {val_l:.4f} | Val Acc: {val_acc*100:.2f}% | "
+                    f"Time: {time.time() - epoch_start:.1f}s"
+                )
 
             if val_p_l < best_val_pitch_loss:
                 best_val_pitch_loss = val_p_l
                 epochs_without_improvement = 0
-                torch.save({'model_state_dict': model.module.state_dict()}, best_checkpoint_path)
+                torch.save({"model_state_dict": model.module.state_dict()}, best_checkpoint_path)
             else:
                 epochs_without_improvement += 1
 
-        stop_signal = torch.tensor([1 if epochs_without_improvement >= hparams['patience'] else 0], device=gpu)
+            pd.DataFrame(history_rows).to_csv(history_csv_path, index=False)
+
+        stop_signal = torch.tensor(
+            [1 if epochs_without_improvement >= hparams["patience"] else 0],
+            device=gpu,
+        )
         dist.all_reduce(stop_signal, op=dist.ReduceOp.SUM)
         if stop_signal.item() > 0:
             break
@@ -491,9 +584,10 @@ if __name__ == '__main__':
         'warmup_epochs': 2,
         'weight_decay': 1e-4,
         'time_loss_weight': 0.5,
-        'label_smoothing': 0.02,
+        'label_smoothing': 0.03,
         'seed': 53,
         'time_clip_upper_percentile': 99.5,
+        'years_to_use': [2004, 2006, 2008, 2009, 2011]
     }
 
     gpus_available = torch.cuda.device_count()
