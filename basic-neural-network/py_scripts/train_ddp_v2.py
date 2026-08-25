@@ -517,7 +517,7 @@ def main_worker(gpu, world_size, hparams):
                 f"Time: {time.time() - epoch_start:.1f}s"
             )
 
-            if (epoch + 1) % 10 == 0:
+            if (epoch + 1) % 5 == 0:
                 print(
                     f"Epoch [{epoch+1}/{hparams['epochs']}] | "
                     f"LR: {current_lr:.6f} | "
@@ -525,7 +525,7 @@ def main_worker(gpu, world_size, hparams):
                     f"Val Loss: {val_l:.4f} | Val Acc: {val_acc*100:.2f}% | "
                     f"Time: {time.time() - epoch_start:.1f}s"
                 )
-                
+
             if val_p_l < best_val_pitch_loss:
                 best_val_pitch_loss = val_p_l
                 epochs_without_improvement = 0
@@ -585,7 +585,7 @@ if __name__ == '__main__':
         'hidden_size': 384,
         'num_layers': 3,
         'batch_size_per_gpu': 1536,
-        'epochs': 30,
+        'epochs': 35,
         'patience': 8,
         'lr': 2e-3,
         'warmup_epochs': 2,
