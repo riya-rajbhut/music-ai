@@ -288,6 +288,112 @@ class OptimizedMusicRNN(nn.Module):
         }
 
 
+def pitch_to_label(pitch_value):
+    """Formats a MIDI pitch number as '<num>(<note>)', e.g. '60(C4)'."""
+    pitch_int = int(pitch_value)
+    return f"{pitch_int}({pm.note_number_to_name(pitch_int)})"
+
+
+def format_pitch_sequence(pitch_sequence):
+    """Formats a full pitch sequence with MIDI numbers and note names."""
+    return "[" + ", ".join(pitch_to_label(p) for p in pitch_sequence) + "]"
+
+
+def format_topk_predictions(topk_indices, topk_probs):
+    """Formats top-k pitch predictions with probabilities."""
+    return "[" + ", ".join(
+        f"{pitch_to_label(pitch)} ({prob:.3f})"
+        for pitch, prob in zip(topk_indices, topk_probs)
+    ) + "]"
+
+
+def format_pitch_prediction_row(split_name, epoch_num, input_sequence, pred_pitch, target_pitch, topk_indices, topk_probs):
+    """Creates a readable console log row for one sample prediction."""
+    return (
+        f"{split_name} Sample | Epoch {epoch_num} | "
+        f"Input: {format_pitch_sequence(input_sequence)} -> "
+        f"Pred Pitch: {pitch_to_label(pred_pitch)} | "
+        f"Target Pitch: {pitch_to_label(target_pitch)} | "
+        f"Top-k: {format_topk_predictions(topk_indices, topk_probs)}"
+    )
+
+
+def compute_pitch_frequency_bucket_ids(song_note_arrays):
+    """Buckets pitches into rare / medium / common using train-set frequency tertiles."""
+    pitch_counts = np.zeros(128, dtype=np.int64)
+    for song_notes in song_note_arrays:
+        notes_array = np.asarray(song_notes, dtype=np.float32)
+        if notes_array.size == 0:
+            continue
+        pitches = notes_array[:, 0].astype(np.int64)
+        pitch_counts += np.bincount(pitches, minlength=128)
+
+    nonzero_counts = pitch_counts[pitch_counts > 0]
+    bucket_ids = np.full(128, -1, dtype=np.int64)
+    bucket_names = ["Rare", "Medium", "Common"]
+
+    if nonzero_counts.size == 0:
+        return bucket_ids, bucket_names, pitch_counts
+
+    lower_cutoff, upper_cutoff = np.quantile(nonzero_counts, [1 / 3, 2 / 3])
+    observed_mask = pitch_counts > 0
+    bucket_ids[np.logical_and(observed_mask, pitch_counts < upper_cutoff)] = 1
+    bucket_ids[np.logical_and(observed_mask, pitch_counts < lower_cutoff)] = 0
+    bucket_ids[np.logical_and(observed_mask, pitch_counts >= upper_cutoff)] = 2
+    return bucket_ids, bucket_names, pitch_counts
+
+
+def summarize_top_pitch_counts(counts, top_n=5):
+    """Formats the most frequent pitches in a count vector."""
+    counts_tensor = torch.as_tensor(counts, dtype=torch.float64)
+    total = counts_tensor.sum().item()
+    if total <= 0:
+        return "None"
+
+    top_n = min(top_n, counts_tensor.numel())
+    top_vals, top_idx = torch.topk(counts_tensor, k=top_n)
+    entries = []
+    for pitch, count in zip(top_idx.tolist(), top_vals.tolist()):
+        if count <= 0:
+            continue
+        entries.append(f"{pitch_to_label(pitch)}: {100.0 * count / total:.1f}%")
+    return ", ".join(entries) if entries else "None"
+
+
+def summarize_pitch_confusions(confusion_matrix, top_n=5):
+    """Formats the most common wrong target->prediction pitch confusions."""
+    confusion = torch.as_tensor(confusion_matrix, dtype=torch.int64).clone()
+    if confusion.numel() == 0:
+        return "None"
+
+    confusion.fill_diagonal_(0)
+    flat = confusion.reshape(-1)
+    nonzero = int((flat > 0).sum().item())
+    if nonzero == 0:
+        return "None"
+
+    top_vals, top_idx = torch.topk(flat, k=min(top_n, nonzero))
+    entries = []
+    for flat_idx, count in zip(top_idx.tolist(), top_vals.tolist()):
+        if count <= 0:
+            continue
+        target_pitch = flat_idx // 128
+        predicted_pitch = flat_idx % 128
+        entries.append(f"{pitch_to_label(target_pitch)} -> {pitch_to_label(predicted_pitch)}: {int(count)}")
+    return ", ".join(entries) if entries else "None"
+
+
+def format_named_accuracy_line(label, names, correct_counts, total_counts):
+    """Formats per-bucket accuracies for logging."""
+    entries = []
+    for name, correct, total in zip(names, correct_counts, total_counts):
+        correct_value = float(correct)
+        total_value = float(total)
+        accuracy = 100.0 * correct_value / total_value if total_value > 0 else 0.0
+        entries.append(f"{name}: {accuracy:.2f}% ({int(correct_value)}/{int(total_value)})")
+    return f"{label} | " + " | ".join(entries)
+
+
 # ==========================================
 # 4. MAIN WORKER & TRAINING LOOP
 # ==========================================
@@ -324,6 +430,9 @@ def main_worker(gpu, world_size, hparams):
     test_notes = clip_extreme_time_values(test_notes, step_max, duration_max)
 
     mean, std = compute_time_feature_stats(train_notes)
+    pitch_bucket_ids_np, pitch_bucket_names, _ = compute_pitch_frequency_bucket_ids(train_notes)
+    pitch_bucket_ids_t = torch.tensor(pitch_bucket_ids_np, device=gpu, dtype=torch.long)
+    interval_bucket_names = ["Repeat", "Step<=2", "Leap3-5", "Leap6-12", "Leap>12"]
 
     train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], time_feature_mean=mean, time_feature_std=std)
     val_dataset = BasicRNNForMusic(val_notes, seq_len=hparams['seq_len'], time_feature_mean=mean, time_feature_std=std)
@@ -390,6 +499,7 @@ def main_worker(gpu, world_size, hparams):
 
         running_loss, running_pitch_loss = 0.0, 0.0
         train_correct, train_total = 0, 0
+        train_debug_rows = []
 
         for batch_idx, (inputs, targets) in enumerate(train_loader):
             x_pitch = inputs[0].cuda(gpu, non_blocking=True)
@@ -411,6 +521,20 @@ def main_worker(gpu, world_size, hparams):
                 loss_duration = criterion_time(preds["duration"], y_time[:, 1:2])
                 train_loss = loss_pitch + hparams["time_loss_weight"] * (loss_step + loss_duration)
 
+                if is_main_process and len(train_debug_rows) < 3:
+                    sample_idx = torch.randint(0, y_pitch.size(0), (1,), device=gpu).item()
+                    probs = torch.softmax(preds["pitch"][sample_idx], dim=0)
+                    topk_probs, topk_indices = torch.topk(probs, k=3)
+
+                    train_debug_rows.append({
+                        "epoch": epoch + 1,
+                        "target_pitch": int(y_pitch[sample_idx].item()),
+                        "pred_pitch": int(predicted_pitch[sample_idx].item()),
+                        "input_sequence": x_pitch[sample_idx].detach().cpu().tolist(),
+                        "topk_indices": topk_indices.detach().cpu().tolist(),
+                        "topk_probs": topk_probs.detach().cpu().tolist(),
+                    })
+
             scaler.scale(train_loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -425,6 +549,14 @@ def main_worker(gpu, world_size, hparams):
         val_loss_tot, val_loss_p = 0.0, 0.0
         val_correct, val_total = 0, 0
         debug_rows = []
+        val_topk_correct = torch.zeros(3, device=gpu, dtype=torch.float64)
+        val_confusion = torch.zeros((128, 128), device=gpu, dtype=torch.int64)
+        val_pred_counts = torch.zeros(128, device=gpu, dtype=torch.int64)
+        val_target_counts = torch.zeros(128, device=gpu, dtype=torch.int64)
+        val_bucket_correct = torch.zeros(3, device=gpu, dtype=torch.float64)
+        val_bucket_total = torch.zeros(3, device=gpu, dtype=torch.float64)
+        val_interval_correct = torch.zeros(5, device=gpu, dtype=torch.float64)
+        val_interval_total = torch.zeros(5, device=gpu, dtype=torch.float64)
 
         with torch.no_grad():
             for inputs, targets in val_loader:
@@ -436,9 +568,39 @@ def main_worker(gpu, world_size, hparams):
                 with autocast("cuda"):
                     preds = model(x_pitch, x_time)
                     predicted_pitch = torch.argmax(preds["pitch"], dim=1)
+                    top5_indices = torch.topk(preds["pitch"], k=5, dim=1).indices
 
                     val_correct += (predicted_pitch == y_pitch).sum().item()
                     val_total += y_pitch.size(0)
+
+                    val_topk_correct[0] += (top5_indices[:, :1] == y_pitch.unsqueeze(1)).any(dim=1).sum().item()
+                    val_topk_correct[1] += (top5_indices[:, :3] == y_pitch.unsqueeze(1)).any(dim=1).sum().item()
+                    val_topk_correct[2] += (top5_indices == y_pitch.unsqueeze(1)).any(dim=1).sum().item()
+
+                    val_pred_counts += torch.bincount(predicted_pitch, minlength=128)
+                    val_target_counts += torch.bincount(y_pitch, minlength=128)
+                    confusion_indices = y_pitch * 128 + predicted_pitch
+                    val_confusion += torch.bincount(confusion_indices, minlength=128 * 128).reshape(128, 128)
+
+                    batch_bucket_ids = pitch_bucket_ids_t[y_pitch]
+                    valid_bucket_mask = batch_bucket_ids >= 0
+                    if valid_bucket_mask.any():
+                        valid_bucket_ids = batch_bucket_ids[valid_bucket_mask]
+                        val_bucket_total += torch.bincount(valid_bucket_ids, minlength=3).to(torch.float64)
+                        correct_bucket_ids = valid_bucket_ids[(predicted_pitch[valid_bucket_mask] == y_pitch[valid_bucket_mask])]
+                        if correct_bucket_ids.numel() > 0:
+                            val_bucket_correct += torch.bincount(correct_bucket_ids, minlength=3).to(torch.float64)
+
+                    interval_sizes = (y_pitch - x_pitch[:, -1]).abs()
+                    interval_bucket_ids = torch.full_like(interval_sizes, 4)
+                    interval_bucket_ids[interval_sizes == 0] = 0
+                    interval_bucket_ids[(interval_sizes > 0) & (interval_sizes <= 2)] = 1
+                    interval_bucket_ids[(interval_sizes >= 3) & (interval_sizes <= 5)] = 2
+                    interval_bucket_ids[(interval_sizes >= 6) & (interval_sizes <= 12)] = 3
+                    val_interval_total += torch.bincount(interval_bucket_ids, minlength=5).to(torch.float64)
+                    correct_interval_ids = interval_bucket_ids[predicted_pitch == y_pitch]
+                    if correct_interval_ids.numel() > 0:
+                        val_interval_correct += torch.bincount(correct_interval_ids, minlength=5).to(torch.float64)
 
                     loss_pitch = criterion_pitch(preds["pitch"], y_pitch)
                     loss_step = criterion_time(preds["step"], y_time[:, 0:1])
@@ -450,11 +612,16 @@ def main_worker(gpu, world_size, hparams):
 
                 if is_main_process and len(debug_rows) < 10:
                     sample_idx = torch.randint(0, y_pitch.size(0), (1,), device=gpu).item()
+                    probs = torch.softmax(preds["pitch"][sample_idx], dim=0)
+                    topk_probs, topk_indices = torch.topk(probs, k=3)
+
                     debug_rows.append({
                         "epoch": epoch + 1,
                         "target_pitch": int(y_pitch[sample_idx].item()),
                         "pred_pitch": int(predicted_pitch[sample_idx].item()),
-                        "input_tail": x_pitch[sample_idx, -10:].detach().cpu().tolist(),
+                        "input_sequence": x_pitch[sample_idx].detach().cpu().tolist(),
+                        "topk_indices": topk_indices.detach().cpu().tolist(),
+                        "topk_probs": topk_probs.detach().cpu().tolist(),
                     })
 
         metrics = torch.tensor(
@@ -472,6 +639,14 @@ def main_worker(gpu, world_size, hparams):
             dtype=torch.float64,
         )
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_topk_correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_confusion, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_pred_counts, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_target_counts, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_bucket_correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_bucket_total, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_interval_correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_interval_total, op=dist.ReduceOp.SUM)
 
         (
             train_l,
@@ -484,8 +659,15 @@ def main_worker(gpu, world_size, hparams):
             val_total_all,
         ) = metrics.tolist()
 
+        train_l /= world_size
+        train_p_l /= world_size
+        val_l /= world_size
+        val_p_l /= world_size
+
         train_acc = train_correct_all / train_total_all if train_total_all else 0.0
         val_acc = val_correct_all / val_total_all if val_total_all else 0.0
+        val_acc_top3 = val_topk_correct[1].item() / val_total_all if val_total_all else 0.0
+        val_acc_top5 = val_topk_correct[2].item() / val_total_all if val_total_all else 0.0
 
         current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step()
@@ -501,6 +683,8 @@ def main_worker(gpu, world_size, hparams):
                     "val_loss": val_l,
                     "val_pitch_loss": val_p_l,
                     "val_acc": val_acc,
+                    "val_acc_top3": val_acc_top3,
+                    "val_acc_top5": val_acc_top5,
                 }
             )
 
@@ -517,6 +701,32 @@ def main_worker(gpu, world_size, hparams):
                 f"Time: {time.time() - epoch_start:.1f}s"
             )
 
+            for row in train_debug_rows:
+                print(
+                    format_pitch_prediction_row(
+                        split_name="Train",
+                        epoch_num=row["epoch"],
+                        input_sequence=row["input_sequence"],
+                        pred_pitch=row["pred_pitch"],
+                        target_pitch=row["target_pitch"],
+                        topk_indices=row["topk_indices"],
+                        topk_probs=row["topk_probs"],
+                    )
+                )
+
+            for row in debug_rows[:3]:
+                print(
+                    format_pitch_prediction_row(
+                        split_name="Val",
+                        epoch_num=row["epoch"],
+                        input_sequence=row["input_sequence"],
+                        pred_pitch=row["pred_pitch"],
+                        target_pitch=row["target_pitch"],
+                        topk_indices=row["topk_indices"],
+                        topk_probs=row["topk_probs"],
+                    )
+                )
+
             if (epoch + 1) % 5 == 0:
                 print(
                     f"Epoch [{epoch+1}/{hparams['epochs']}] | "
@@ -524,6 +734,37 @@ def main_worker(gpu, world_size, hparams):
                     f"Train Loss: {train_l:.4f} | Train Acc: {train_acc*100:.2f}% | "
                     f"Val Loss: {val_l:.4f} | Val Acc: {val_acc*100:.2f}% | "
                     f"Time: {time.time() - epoch_start:.1f}s"
+                )
+                print(
+                    f"Val Pitch Top-k Accuracy | "
+                    f"Acc@1: {val_acc*100:.2f}% | "
+                    f"Acc@3: {val_acc_top3*100:.2f}% | "
+                    f"Acc@5: {val_acc_top5*100:.2f}%"
+                )
+                print(
+                    format_named_accuracy_line(
+                        "Val Pitch Frequency Bucket Accuracy",
+                        pitch_bucket_names,
+                        val_bucket_correct.detach().cpu().tolist(),
+                        val_bucket_total.detach().cpu().tolist(),
+                    )
+                )
+                print(
+                    format_named_accuracy_line(
+                        "Val Interval Bucket Accuracy",
+                        interval_bucket_names,
+                        val_interval_correct.detach().cpu().tolist(),
+                        val_interval_total.detach().cpu().tolist(),
+                    )
+                )
+                print(
+                    "Val Most Common Pitch Confusions | "
+                    + summarize_pitch_confusions(val_confusion.detach().cpu(), top_n=5)
+                )
+                print(
+                    "Val Pitch Distribution | "
+                    f"Pred Top: {summarize_top_pitch_counts(val_pred_counts.detach().cpu(), top_n=5)} | "
+                    f"Target Top: {summarize_top_pitch_counts(val_target_counts.detach().cpu(), top_n=5)}"
                 )
 
             if val_p_l < best_val_pitch_loss:
@@ -552,6 +793,7 @@ def main_worker(gpu, world_size, hparams):
 
         correct_pitch, total_samples = 0, 0
         sum_err_step, sum_err_duration = 0.0, 0.0
+        test_debug_rows = []
         time_mean_t, time_std_t = torch.tensor(mean, device=0), torch.tensor(std, device=0)
 
         with torch.no_grad():
@@ -572,9 +814,34 @@ def main_worker(gpu, world_size, hparams):
                     sum_err_step += (pred_step_sec - true_step_sec).abs().sum().item()
                     sum_err_duration += (pred_dur_sec - true_dur_sec).abs().sum().item()
 
+                if len(test_debug_rows) < 5:
+                    samples_to_add = min(5 - len(test_debug_rows), y_pitch.size(0))
+                    for sample_idx in range(samples_to_add):
+                        probs = torch.softmax(preds['pitch'][sample_idx], dim=0)
+                        topk_probs, topk_indices = torch.topk(probs, k=3)
+                        test_debug_rows.append({
+                            "input_sequence": x_pitch[sample_idx].detach().cpu().tolist(),
+                            "pred_pitch": int(predicted_classes[sample_idx].item()),
+                            "target_pitch": int(y_pitch[sample_idx].item()),
+                            "topk_indices": topk_indices.detach().cpu().tolist(),
+                            "topk_probs": topk_probs.detach().cpu().tolist(),
+                        })
+
         if total_samples > 0:
             print(f"Final Pitch Accuracy: {(correct_pitch / total_samples) * 100:.2f}%")
             print(f"Final Step MAE: {sum_err_step / total_samples:.4f}s | Duration MAE: {sum_err_duration / total_samples:.4f}s")
+            for row in test_debug_rows:
+                print(
+                    format_pitch_prediction_row(
+                        split_name="Test",
+                        epoch_num="final",
+                        input_sequence=row["input_sequence"],
+                        pred_pitch=row["pred_pitch"],
+                        target_pitch=row["target_pitch"],
+                        topk_indices=row["topk_indices"],
+                        topk_probs=row["topk_probs"],
+                    )
+                )
 
     dist.destroy_process_group()
 
