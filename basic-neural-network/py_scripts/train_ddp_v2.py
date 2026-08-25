@@ -63,7 +63,7 @@ def convert_midi_to_notes(midi_file_path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     instrument = midi_data.instruments[0]
-    sorted_notes = sorted(instrument.notes, key=lambda note: note.start)
+    sorted_notes = sorted(instrument.notes, key=lambda note: (note.start, note.pitch))
     if not sorted_notes:
         return pd.DataFrame()
 
@@ -102,8 +102,9 @@ def convert_all_songs_to_notes(dataset_root: pathlib.Path, years_to_use=None) ->
 
 def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool, years_to_use=None) -> list:
     """Handles cached dataset reading and writing for multi-GPU safety."""
+    cache_version = "v2_sorted_chords"
     year_tag = "all" if years_to_use is None else "_".join(map(str, years_to_use))
-    cache_file = dataset_root / f'converted_notes_{year_tag}.pkl'
+    cache_file = dataset_root / f'converted_notes_{cache_version}_{year_tag}.pkl'
 
     if is_main_process:
         if cache_file.exists():
