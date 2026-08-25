@@ -510,7 +510,14 @@ def main_worker(gpu, world_size, hparams):
                     index=False,
                 )
 
-            if (epoch + 1) % 10 == 0:
+            print(
+                f"Epoch [{epoch+1}/{hparams['epochs']}] | "
+                f"Train Loss: {train_l:.4f} (Pitch: {train_p_l:.4f}) | "
+                f"Val Loss: {val_l:.4f} (Pitch: {val_p_l:.4f}) | "
+                f"Time: {time.time() - epoch_start:.1f}s"
+            )
+
+            if (epoch + 1) % 5 == 0:
                 print(
                     f"Epoch [{epoch+1}/{hparams['epochs']}] | "
                     f"LR: {current_lr:.6f} | "
@@ -578,7 +585,7 @@ if __name__ == '__main__':
         'hidden_size': 384,
         'num_layers': 3,
         'batch_size_per_gpu': 1536,
-        'epochs': 30,
+        'epochs': 35,
         'patience': 8,
         'lr': 2e-3,
         'warmup_epochs': 2,
