@@ -510,6 +510,13 @@ def main_worker(gpu, world_size, hparams):
                     index=False,
                 )
 
+            print(
+                f"Epoch [{epoch+1}/{hparams['epochs']}] | "
+                f"Train Loss: {train_l:.4f} (Pitch: {train_p_l:.4f}) | "
+                f"Val Loss: {val_l:.4f} (Pitch: {val_p_l:.4f}) | "
+                f"Time: {time.time() - epoch_start:.1f}s"
+            )
+
             if (epoch + 1) % 10 == 0:
                 print(
                     f"Epoch [{epoch+1}/{hparams['epochs']}] | "
@@ -518,7 +525,7 @@ def main_worker(gpu, world_size, hparams):
                     f"Val Loss: {val_l:.4f} | Val Acc: {val_acc*100:.2f}% | "
                     f"Time: {time.time() - epoch_start:.1f}s"
                 )
-
+                
             if val_p_l < best_val_pitch_loss:
                 best_val_pitch_loss = val_p_l
                 epochs_without_improvement = 0
