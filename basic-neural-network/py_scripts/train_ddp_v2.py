@@ -257,6 +257,12 @@ class OptimizedMusicRNN(nn.Module):
         )
         self.dropout = nn.Dropout(dropout_rate)
 
+        # Direct path from "the last note the model just saw" to the pitch head, so
+        # repeating the previous pitch doesn't have to survive a trip through 3 LSTM
+        # layers of recurrence to be predicted correctly.
+        self.skip_proj = nn.Linear(pitch_embed_dim, hidden_size)
+
+
         self.pitch_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
@@ -282,8 +288,14 @@ class OptimizedMusicRNN(nn.Module):
         _, (h_n, _) = self.lstm(x)
         last_out = self.dropout(h_n[-1])
 
+        # Embedding of the most recent input note, added straight into the pitch head's
+        # input — a direct shortcut for the "repeat the last note" case.
+        last_pitch_embed = pitch_embeds[:, -1, :]
+        pitch_input = last_out + self.skip_proj(last_pitch_embed)
+
+
         return {
-            'pitch': self.pitch_head(last_out),
+            'pitch': self.pitch_head(pitch_input),
             'step': self.step_head(last_out),
             'duration': self.duration_head(last_out),
         }
@@ -316,6 +328,48 @@ def format_pitch_prediction_row(split_name, epoch_num, input_sequence, pred_pitc
         f"Pred Pitch: {pitch_to_label(pred_pitch)} | "
         f"Target Pitch: {pitch_to_label(target_pitch)} | "
         f"Top-k: {format_topk_predictions(topk_indices, topk_probs)}"
+    )
+
+
+TARGET_TAIL_PITCHES = (60, 64, 67)
+
+
+def find_tail_match_row(x_pitch, y_pitch, predicted_pitch, preds_pitch, epoch_num):
+    """Returns one debug row when the last 3 pitches match TARGET_TAIL_PITCHES."""
+    if x_pitch.size(1) < len(TARGET_TAIL_PITCHES):
+        return None
+
+    target_tail = torch.tensor(TARGET_TAIL_PITCHES, device=x_pitch.device, dtype=x_pitch.dtype)
+    match_mask = (x_pitch[:, -len(TARGET_TAIL_PITCHES):] == target_tail.unsqueeze(0)).all(dim=1)
+    if not match_mask.any():
+        return None
+
+    sample_idx = torch.nonzero(match_mask, as_tuple=False)[0].item()
+    probs = torch.softmax(preds_pitch[sample_idx], dim=0)
+    topk_probs, topk_indices = torch.topk(probs, k=3)
+    return {
+        "epoch": epoch_num,
+        "target_pitch": int(y_pitch[sample_idx].item()),
+        "pred_pitch": int(predicted_pitch[sample_idx].item()),
+        "input_sequence": x_pitch[sample_idx].detach().cpu().tolist(),
+        "topk_indices": topk_indices.detach().cpu().tolist(),
+        "topk_probs": topk_probs.detach().cpu().tolist(),
+    }
+
+
+def format_target_tail_prediction_row(split_name, epoch_num, row):
+    """Formats a targeted log row for TARGET_TAIL_PITCHES."""
+    return (
+        f"{split_name} Target Tail Match {tuple(pitch_to_label(p) for p in TARGET_TAIL_PITCHES)} | "
+        + format_pitch_prediction_row(
+            split_name=split_name,
+            epoch_num=epoch_num,
+            input_sequence=row["input_sequence"],
+            pred_pitch=row["pred_pitch"],
+            target_pitch=row["target_pitch"],
+            topk_indices=row["topk_indices"],
+            topk_probs=row["topk_probs"],
+        )
     )
 
 
@@ -501,6 +555,7 @@ def main_worker(gpu, world_size, hparams):
         running_loss, running_pitch_loss = 0.0, 0.0
         train_correct, train_total = 0, 0
         train_debug_rows = []
+        train_target_tail_row = None
 
         for batch_idx, (inputs, targets) in enumerate(train_loader):
             x_pitch = inputs[0].cuda(gpu, non_blocking=True)
@@ -536,6 +591,15 @@ def main_worker(gpu, world_size, hparams):
                         "topk_probs": topk_probs.detach().cpu().tolist(),
                     })
 
+                if is_main_process and train_target_tail_row is None:
+                    train_target_tail_row = find_tail_match_row(
+                        x_pitch=x_pitch,
+                        y_pitch=y_pitch,
+                        predicted_pitch=predicted_pitch,
+                        preds_pitch=preds["pitch"],
+                        epoch_num=epoch + 1,
+                    )
+
             scaler.scale(train_loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -558,6 +622,7 @@ def main_worker(gpu, world_size, hparams):
         val_bucket_total = torch.zeros(3, device=gpu, dtype=torch.float64)
         val_interval_correct = torch.zeros(5, device=gpu, dtype=torch.float64)
         val_interval_total = torch.zeros(5, device=gpu, dtype=torch.float64)
+        val_target_tail_row = None
 
         with torch.no_grad():
             for inputs, targets in val_loader:
@@ -624,6 +689,15 @@ def main_worker(gpu, world_size, hparams):
                         "topk_indices": topk_indices.detach().cpu().tolist(),
                         "topk_probs": topk_probs.detach().cpu().tolist(),
                     })
+
+                if is_main_process and val_target_tail_row is None:
+                    val_target_tail_row = find_tail_match_row(
+                        x_pitch=x_pitch,
+                        y_pitch=y_pitch,
+                        predicted_pitch=predicted_pitch,
+                        preds_pitch=preds["pitch"],
+                        epoch_num=epoch + 1,
+                    )
 
         metrics = torch.tensor(
             [
@@ -715,6 +789,9 @@ def main_worker(gpu, world_size, hparams):
                     )
                 )
 
+            if train_target_tail_row is not None:
+                print(format_target_tail_prediction_row("Train", epoch + 1, train_target_tail_row))
+
             for row in debug_rows[:3]:
                 print(
                     format_pitch_prediction_row(
@@ -727,6 +804,9 @@ def main_worker(gpu, world_size, hparams):
                         topk_probs=row["topk_probs"],
                     )
                 )
+
+            if val_target_tail_row is not None:
+                print(format_target_tail_prediction_row("Val", epoch + 1, val_target_tail_row))
 
             if (epoch + 1) % 5 == 0:
                 print(
@@ -795,6 +875,7 @@ def main_worker(gpu, world_size, hparams):
         correct_pitch, total_samples = 0, 0
         sum_err_step, sum_err_duration = 0.0, 0.0
         test_debug_rows = []
+        test_target_tail_row = None
         time_mean_t, time_std_t = torch.tensor(mean, device=0), torch.tensor(std, device=0)
 
         with torch.no_grad():
@@ -828,6 +909,15 @@ def main_worker(gpu, world_size, hparams):
                             "topk_probs": topk_probs.detach().cpu().tolist(),
                         })
 
+                if test_target_tail_row is None:
+                    test_target_tail_row = find_tail_match_row(
+                        x_pitch=x_pitch,
+                        y_pitch=y_pitch,
+                        predicted_pitch=predicted_classes,
+                        preds_pitch=preds['pitch'],
+                        epoch_num="final",
+                    )
+
         if total_samples > 0:
             print(f"Final Pitch Accuracy: {(correct_pitch / total_samples) * 100:.2f}%")
             print(f"Final Step MAE: {sum_err_step / total_samples:.4f}s | Duration MAE: {sum_err_duration / total_samples:.4f}s")
@@ -843,6 +933,8 @@ def main_worker(gpu, world_size, hparams):
                         topk_probs=row["topk_probs"],
                     )
                 )
+            if test_target_tail_row is not None:
+                print(format_target_tail_prediction_row("Test", "final", test_target_tail_row))
 
     dist.destroy_process_group()
 
