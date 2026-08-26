@@ -459,6 +459,7 @@ def main_worker(gpu, world_size, hparams):
     interval_bucket_names = ["Repeat", "Step<=2", "Leap3-5", "Leap6-12", "Leap>12"]
 
     train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], time_feature_mean=mean, time_feature_std=std, augment=True)
+    val_dataset = BasicRNNForMusic(val_notes, seq_len=hparams['seq_len'], time_feature_mean=mean, time_feature_std=std, augment=False)
     test_dataset = BasicRNNForMusic(test_notes, seq_len=hparams['seq_len'], time_feature_mean=mean, time_feature_std=std, augment=False)
 
     if is_main_process:
