@@ -178,8 +178,9 @@ def compute_time_feature_stats(song_note_arrays):
 class BasicRNNForMusic(data.Dataset):
     """Sliding window dataset for sequence prediction."""
 
-    def __init__(self, song_note_arrays, seq_len=64, time_feature_mean=None, time_feature_std=None):
+    def __init__(self, song_note_arrays, seq_len=64, time_feature_mean=None, time_feature_std=None, augment=False):
         self.seq_len = seq_len
+        self.augment = augment
         self.song_pitches = []
         self.song_time_features = []
         self.index_map = []
@@ -206,11 +207,19 @@ class BasicRNNForMusic(data.Dataset):
     def __getitem__(self, idx):
         song_idx, start_idx = self.index_map[idx]
         end_idx = start_idx + self.seq_len
-        return (
-            (self.song_pitches[song_idx][start_idx:end_idx], self.song_time_features[song_idx][start_idx:end_idx]),
-            (self.song_pitches[song_idx][end_idx], self.song_time_features[song_idx][end_idx])
-        )
+        pitch_seq = self.song_pitches[song_idx][start_idx:end_idx].clone()
+        target_pitch = self.song_pitches[song_idx][end_idx].clone()
+        
+        if self.augment:
+            # Shift by a random interval between -5 and +5 semitones
+            shift = torch.randint(-5, 6, (1,)).item()
+            pitch_seq = torch.clamp(pitch_seq + shift, 0, 127)
+            target_pitch = torch.clamp(target_pitch + shift, 0, 127)
 
+        return (
+            (pitch_seq, self.song_time_features[song_idx][start_idx:end_idx]),
+            (target_pitch, self.song_time_features[song_idx][end_idx])
+        )
 
 def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
     """Splits full songs into train, validation, and test splits."""
@@ -333,48 +342,6 @@ def format_pitch_prediction_row(split_name, epoch_num, input_sequence, pred_pitc
     )
 
 
-TARGET_TAIL_PITCHES = (60, 64, 67)
-
-
-def find_tail_match_row(x_pitch, y_pitch, predicted_pitch, preds_pitch, epoch_num):
-    """Returns one debug row when the last 3 pitches match TARGET_TAIL_PITCHES."""
-    if x_pitch.size(1) < len(TARGET_TAIL_PITCHES):
-        return None
-
-    target_tail = torch.tensor(TARGET_TAIL_PITCHES, device=x_pitch.device, dtype=x_pitch.dtype)
-    match_mask = (x_pitch[:, -len(TARGET_TAIL_PITCHES):] == target_tail.unsqueeze(0)).all(dim=1)
-    if not match_mask.any():
-        return None
-
-    sample_idx = torch.nonzero(match_mask, as_tuple=False)[0].item()
-    probs = torch.softmax(preds_pitch[sample_idx], dim=0)
-    topk_probs, topk_indices = torch.topk(probs, k=3)
-    return {
-        "epoch": epoch_num,
-        "target_pitch": int(y_pitch[sample_idx].item()),
-        "pred_pitch": int(predicted_pitch[sample_idx].item()),
-        "input_sequence": x_pitch[sample_idx].detach().cpu().tolist(),
-        "topk_indices": topk_indices.detach().cpu().tolist(),
-        "topk_probs": topk_probs.detach().cpu().tolist(),
-    }
-
-
-def format_target_tail_prediction_row(split_name, epoch_num, row):
-    """Formats a targeted log row for TARGET_TAIL_PITCHES."""
-    return (
-        f"{split_name} Target Tail Match {tuple(pitch_to_label(p) for p in TARGET_TAIL_PITCHES)} | "
-        + format_pitch_prediction_row(
-            split_name=split_name,
-            epoch_num=epoch_num,
-            input_sequence=row["input_sequence"],
-            pred_pitch=row["pred_pitch"],
-            target_pitch=row["target_pitch"],
-            topk_indices=row["topk_indices"],
-            topk_probs=row["topk_probs"],
-        )
-    )
-
-
 def compute_pitch_frequency_bucket_ids(song_note_arrays):
     """Buckets pitches into rare / medium / common using train-set frequency tertiles."""
     pitch_counts = np.zeros(128, dtype=np.int64)
@@ -491,9 +458,8 @@ def main_worker(gpu, world_size, hparams):
     pitch_bucket_ids_t = torch.tensor(pitch_bucket_ids_np, device=gpu, dtype=torch.long)
     interval_bucket_names = ["Repeat", "Step<=2", "Leap3-5", "Leap6-12", "Leap>12"]
 
-    train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], time_feature_mean=mean, time_feature_std=std)
-    val_dataset = BasicRNNForMusic(val_notes, seq_len=hparams['seq_len'], time_feature_mean=mean, time_feature_std=std)
-    test_dataset = BasicRNNForMusic(test_notes, seq_len=hparams['seq_len'], time_feature_mean=mean, time_feature_std=std)
+    train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], time_feature_mean=mean, time_feature_std=std, augment=True)
+    test_dataset = BasicRNNForMusic(test_notes, seq_len=hparams['seq_len'], time_feature_mean=mean, time_feature_std=std, augment=False)
 
     if is_main_process:
         print(f"Dataset split — Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
@@ -557,7 +523,6 @@ def main_worker(gpu, world_size, hparams):
         running_loss, running_pitch_loss = 0.0, 0.0
         train_correct, train_total = 0, 0
         train_debug_rows = []
-        train_target_tail_row = None
 
         for batch_idx, (inputs, targets) in enumerate(train_loader):
             x_pitch = inputs[0].cuda(gpu, non_blocking=True)
@@ -593,15 +558,6 @@ def main_worker(gpu, world_size, hparams):
                         "topk_probs": topk_probs.detach().cpu().tolist(),
                     })
 
-                if is_main_process and train_target_tail_row is None:
-                    train_target_tail_row = find_tail_match_row(
-                        x_pitch=x_pitch,
-                        y_pitch=y_pitch,
-                        predicted_pitch=predicted_pitch,
-                        preds_pitch=preds["pitch"],
-                        epoch_num=epoch + 1,
-                    )
-
             scaler.scale(train_loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -624,7 +580,6 @@ def main_worker(gpu, world_size, hparams):
         val_bucket_total = torch.zeros(3, device=gpu, dtype=torch.float64)
         val_interval_correct = torch.zeros(5, device=gpu, dtype=torch.float64)
         val_interval_total = torch.zeros(5, device=gpu, dtype=torch.float64)
-        val_target_tail_row = None
 
         with torch.no_grad():
             for inputs, targets in val_loader:
@@ -691,15 +646,6 @@ def main_worker(gpu, world_size, hparams):
                         "topk_indices": topk_indices.detach().cpu().tolist(),
                         "topk_probs": topk_probs.detach().cpu().tolist(),
                     })
-
-                if is_main_process and val_target_tail_row is None:
-                    val_target_tail_row = find_tail_match_row(
-                        x_pitch=x_pitch,
-                        y_pitch=y_pitch,
-                        predicted_pitch=predicted_pitch,
-                        preds_pitch=preds["pitch"],
-                        epoch_num=epoch + 1,
-                    )
 
         metrics = torch.tensor(
             [
@@ -791,9 +737,6 @@ def main_worker(gpu, world_size, hparams):
                     )
                 )
 
-            if train_target_tail_row is not None:
-                print(format_target_tail_prediction_row("Train", epoch + 1, train_target_tail_row))
-
             for row in debug_rows[:3]:
                 print(
                     format_pitch_prediction_row(
@@ -806,9 +749,6 @@ def main_worker(gpu, world_size, hparams):
                         topk_probs=row["topk_probs"],
                     )
                 )
-
-            if val_target_tail_row is not None:
-                print(format_target_tail_prediction_row("Val", epoch + 1, val_target_tail_row))
 
             if (epoch + 1) % 5 == 0:
                 print(
@@ -877,7 +817,6 @@ def main_worker(gpu, world_size, hparams):
         correct_pitch, total_samples = 0, 0
         sum_err_step, sum_err_duration = 0.0, 0.0
         test_debug_rows = []
-        test_target_tail_row = None
         time_mean_t, time_std_t = torch.tensor(mean, device=0), torch.tensor(std, device=0)
 
         with torch.no_grad():
@@ -911,15 +850,6 @@ def main_worker(gpu, world_size, hparams):
                             "topk_probs": topk_probs.detach().cpu().tolist(),
                         })
 
-                if test_target_tail_row is None:
-                    test_target_tail_row = find_tail_match_row(
-                        x_pitch=x_pitch,
-                        y_pitch=y_pitch,
-                        predicted_pitch=predicted_classes,
-                        preds_pitch=preds['pitch'],
-                        epoch_num="final",
-                    )
-
         if total_samples > 0:
             print(f"Final Pitch Accuracy: {(correct_pitch / total_samples) * 100:.2f}%")
             print(f"Final Step MAE: {sum_err_step / total_samples:.4f}s | Duration MAE: {sum_err_duration / total_samples:.4f}s")
@@ -935,21 +865,19 @@ def main_worker(gpu, world_size, hparams):
                         topk_probs=row["topk_probs"],
                     )
                 )
-            if test_target_tail_row is not None:
-                print(format_target_tail_prediction_row("Test", "final", test_target_tail_row))
 
     dist.destroy_process_group()
 
 
 if __name__ == '__main__':
     hyperparameters = {
-        'seq_len': 64,
+        'seq_len': 128,
         'hidden_size': 384,
         'num_layers': 3,
         'batch_size_per_gpu': 256,
         'epochs': 35,
         'patience': 8,
-        'lr': 2e-3,
+        'lr': 1e-3,
         'warmup_epochs': 2,
         'weight_decay': 1e-4,
         'time_loss_weight': 0.5,
