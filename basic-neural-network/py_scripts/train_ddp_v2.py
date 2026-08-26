@@ -261,6 +261,7 @@ class OptimizedMusicRNN(nn.Module):
         # repeating the previous pitch doesn't have to survive a trip through 3 LSTM
         # layers of recurrence to be predicted correctly.
         self.skip_proj = nn.Linear(pitch_embed_dim, hidden_size)
+        self.gate_proj = nn.Linear(hidden_size, hidden_size)
 
 
         self.pitch_head = nn.Sequential(
@@ -291,7 +292,8 @@ class OptimizedMusicRNN(nn.Module):
         # Embedding of the most recent input note, added straight into the pitch head's
         # input — a direct shortcut for the "repeat the last note" case.
         last_pitch_embed = pitch_embeds[:, -1, :]
-        pitch_input = last_out + self.skip_proj(last_pitch_embed)
+        gate = torch.sigmoid(self.gate_proj(last_out))
+        pitch_input = last_out + gate * self.skip_proj(last_pitch_embed)
 
 
         return {
@@ -944,14 +946,14 @@ if __name__ == '__main__':
         'seq_len': 64,
         'hidden_size': 384,
         'num_layers': 3,
-        'batch_size_per_gpu': 1536,
+        'batch_size_per_gpu': 256,
         'epochs': 35,
         'patience': 8,
         'lr': 2e-3,
         'warmup_epochs': 2,
         'weight_decay': 1e-4,
         'time_loss_weight': 0.5,
-        'label_smoothing': 0.03,
+        'label_smoothing': 0.0,
         'seed': 53,
         'time_clip_upper_percentile': 99.5,
         'years_to_use': [2004, 2006, 2008, 2009, 2011]
