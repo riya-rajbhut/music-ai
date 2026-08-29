@@ -245,18 +245,24 @@ class OptimizedMusicRNN(nn.Module):
         self.skip_proj = nn.Linear(pitch_embed_dim, hidden_size)
         self.gate_proj = nn.Linear(hidden_size, hidden_size)
 
-        self.pitch_class_head = nn.Sequential(
+        # Feature Extractors for conceptual understanding
+        self.pc_feature_extractor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_size, 12),
+            nn.Dropout(dropout_rate)
         )
-        self.octave_head = nn.Sequential(
+        self.oct_feature_extractor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_size, 11),
+            nn.Dropout(dropout_rate)
         )
+
+        # Auxiliary Heads
+        self.pc_head = nn.Linear(hidden_size, 12)
+        self.oct_head = nn.Linear(hidden_size, 11)
+
+        # Joint Fusion Layer
+        self.fusion_layer = nn.Linear(hidden_size * 2, num_pitches)
 
         self.step_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
@@ -287,18 +293,21 @@ class OptimizedMusicRNN(nn.Module):
         gate = torch.sigmoid(self.gate_proj(last_out))
         pitch_input = last_out + gate * self.skip_proj(last_pitch_embed)
 
-        pc_logits = self.pitch_class_head(pitch_input)    # [batch, 12]
-        oct_logits = self.octave_head(pitch_input)        # [batch, 11]
+        # Extract features and compute auxiliary logits
+        pc_features = self.pc_feature_extractor(pitch_input)
+        oct_features = self.oct_feature_extractor(pitch_input)
+        
+        pc_logits = self.pc_head(pc_features)
+        oct_logits = self.oct_head(oct_features)
 
-        # Compute joint logits directly by adding independent logits.
-        joint_logits = oct_logits.unsqueeze(2) + pc_logits.unsqueeze(1) # [batch, 11, 12]
-
-        # Flatten 132 classes down to standard MIDI range [batch, 128].
-        combined_pitch_logits = joint_logits.flatten(start_dim=1)[:, :self.num_pitches]
+        # Joint Fusion Layer for final prediction
+        combined_features = torch.cat([pc_features, oct_features], dim=-1)
+        joint_logits = self.fusion_layer(combined_features)
 
         return {
-            'pitch': combined_pitch_logits,
-            'pc_logits': pc_logits,      # Added to track pitch_class loss separately
+            'pitch': joint_logits,
+            'pc_logits': pc_logits,
+            'oct_logits': oct_logits,
             'step': self.step_head(last_out),
             'duration': self.duration_head(last_out),
         }
@@ -487,7 +496,7 @@ def main_worker(gpu, world_size, hparams):
         train_sampler.set_epoch(epoch)
         model.train()
 
-        running_loss, running_pitch_loss, running_pc_loss = 0.0, 0.0, 0.0
+        running_loss, running_pitch_loss, running_pc_loss, running_oct_loss = 0.0, 0.0, 0.0, 0.0
         train_correct, train_total = 0, 0
         train_debug_rows = []
 
@@ -506,15 +515,16 @@ def main_worker(gpu, world_size, hparams):
                 train_correct += (predicted_pitch == y_pitch).sum().item()
                 train_total += y_pitch.size(0)
 
+                # Primary and Auxiliary Losses
                 loss_pitch = criterion_pitch(preds["pitch"], y_pitch)
-                loss_pc = criterion_pitch(preds["pc_logits"], y_pitch % 12) # Evaluate pitch class separately for logging
+                loss_pc = criterion_pitch(preds["pc_logits"], y_pitch % 12) 
+                loss_oct = criterion_pitch(preds["oct_logits"], torch.clamp(y_pitch // 12, 0, 10))
                 
                 loss_step = criterion_time(preds["step"], y_time[:, 0:1])
                 loss_duration = criterion_time(preds["duration"], y_time[:, 1:2])
                 
-                # We do not add loss_pc to train_loss here to avoid altering your optimization landscape. 
-                # The model naturally learns it via the decomposed embeds + joint cross_entropy anyway.
-                train_loss = loss_pitch + hparams["time_loss_weight"] * (loss_step + loss_duration)
+                # Integrated Backpropagation
+                train_loss = loss_pitch + (hparams['lambda_pc'] * loss_pc) + (hparams['lambda_oct'] * loss_oct) + hparams["time_loss_weight"] * (loss_step + loss_duration)
 
                 if is_main_process and len(train_debug_rows) < 3:
                     sample_idx = torch.randint(0, y_pitch.size(0), (1,), device=gpu).item()
@@ -539,10 +549,11 @@ def main_worker(gpu, world_size, hparams):
             running_loss += train_loss.item()
             running_pitch_loss += loss_pitch.item()
             running_pc_loss += loss_pc.item()
+            running_oct_loss += loss_oct.item()
 
         # Evaluation
         model.eval()
-        val_loss_tot, val_loss_p, val_loss_pc = 0.0, 0.0, 0.0
+        val_loss_tot, val_loss_p, val_loss_pc, val_loss_oct = 0.0, 0.0, 0.0, 0.0
         val_correct, val_total = 0, 0
         val_pc_correct, val_oct_correct, val_pure_octave_errors = 0, 0, 0
         debug_rows = []
@@ -612,13 +623,15 @@ def main_worker(gpu, world_size, hparams):
 
                     loss_pitch = criterion_pitch(preds["pitch"], y_pitch)
                     loss_pc = criterion_pitch(preds["pc_logits"], y_pitch % 12)
+                    loss_oct = criterion_pitch(preds["oct_logits"], torch.clamp(y_pitch // 12, 0, 10))
                     loss_step = criterion_time(preds["step"], y_time[:, 0:1])
                     loss_duration = criterion_time(preds["duration"], y_time[:, 1:2])
-                    val_loss = loss_pitch + hparams["time_loss_weight"] * (loss_step + loss_duration)
+                    val_loss = loss_pitch + (hparams['lambda_pc'] * loss_pc) + (hparams['lambda_oct'] * loss_oct) + hparams["time_loss_weight"] * (loss_step + loss_duration)
 
                     val_loss_tot += val_loss.item()
                     val_loss_p += loss_pitch.item()
                     val_loss_pc += loss_pc.item()
+                    val_loss_oct += loss_oct.item()
 
                 if is_main_process and len(debug_rows) < 10:
                     sample_idx = torch.randint(0, y_pitch.size(0), (1,), device=gpu).item()
@@ -639,9 +652,11 @@ def main_worker(gpu, world_size, hparams):
                 running_loss / len(train_loader),
                 running_pitch_loss / len(train_loader),
                 running_pc_loss / len(train_loader),
+                running_oct_loss / len(train_loader),
                 val_loss_tot / len(val_loader),
                 val_loss_p / len(val_loader),
                 val_loss_pc / len(val_loader),
+                val_loss_oct / len(val_loader),
                 train_correct,
                 train_total,
                 val_correct,
@@ -667,9 +682,11 @@ def main_worker(gpu, world_size, hparams):
             train_l,
             train_p_l,
             train_pc_l,
+            train_oct_l,
             val_l,
             val_p_l,
             val_pc_l,
+            val_oct_l,
             train_correct_all,
             train_total_all,
             val_correct_all,
@@ -682,16 +699,17 @@ def main_worker(gpu, world_size, hparams):
         train_l /= world_size
         train_p_l /= world_size
         train_pc_l /= world_size
+        train_oct_l /= world_size
         val_l /= world_size
         val_p_l /= world_size
         val_pc_l /= world_size
+        val_oct_l /= world_size
 
         train_acc = train_correct_all / train_total_all if train_total_all else 0.0
         val_acc = val_correct_all / val_total_all if val_total_all else 0.0
         val_acc_top3 = val_topk_correct[1].item() / val_total_all if val_total_all else 0.0
         val_acc_top5 = val_topk_correct[2].item() / val_total_all if val_total_all else 0.0
         
-        # Calculate decomposed accuracy percentages
         val_pc_acc = val_pc_correct_all / val_total_all if val_total_all else 0.0
         val_oct_acc = val_oct_correct_all / val_total_all if val_total_all else 0.0
         val_pure_oct_err_rate = val_pure_octave_errors_all / val_total_all if val_total_all else 0.0
@@ -707,10 +725,12 @@ def main_worker(gpu, world_size, hparams):
                     "train_loss": train_l,
                     "train_pitch_loss": train_p_l,
                     "train_pc_loss": train_pc_l,
+                    "train_oct_loss": train_oct_l,
                     "train_acc": train_acc,
                     "val_loss": val_l,
                     "val_pitch_loss": val_p_l,
                     "val_pc_loss": val_pc_l,
+                    "val_oct_loss": val_oct_l,
                     "val_acc": val_acc,
                     "val_acc_top3": val_acc_top3,
                     "val_acc_top5": val_acc_top5,
@@ -728,8 +748,8 @@ def main_worker(gpu, world_size, hparams):
 
             print(
                 f"Epoch [{epoch+1}/{hparams['epochs']}] | "
-                f"Train Loss: {train_l:.4f} (Pitch: {train_p_l:.4f}, PC: {train_pc_l:.4f}) | "
-                f"Val Loss: {val_l:.4f} (Pitch: {val_p_l:.4f}, PC: {val_pc_l:.4f}) | "
+                f"Train Loss: {train_l:.4f} (Pitch: {train_p_l:.4f}, PC: {train_pc_l:.4f}, Oct: {train_oct_l:.4f}) | "
+                f"Val Loss: {val_l:.4f} (Pitch: {val_p_l:.4f}, PC: {val_pc_l:.4f}, Oct: {val_oct_l:.4f}) | "
                 f"Time: {time.time() - epoch_start:.1f}s"
             )
 
@@ -896,6 +916,8 @@ if __name__ == '__main__':
         'warmup_epochs': 2,
         'weight_decay': 1e-4,
         'time_loss_weight': 0.5,
+        'lambda_pc': 0.1,       # Tuning parameter for Pitch Class auxiliary loss
+        'lambda_oct': 0.3,      # Tuning parameter for Octave auxiliary loss
         'label_smoothing': 0.0,
         'seed': 53,
         'time_clip_upper_percentile': 99.5,
