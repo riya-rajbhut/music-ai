@@ -220,7 +220,7 @@ def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
 
 class OptimizedMusicRNN(nn.Module):
     """Predicts (pitch, step, duration) for the next note using pitch class and octave decomposition."""
-    def __init__(self, num_pitches=128, pitch_embed_dim=128, hidden_size=384, num_layers=2, dropout_rate=0.3):
+    def __init__(self, num_pitches=128, pitch_embed_dim=128, hidden_size=384, num_layers=3, dropout_rate=0.3):
         super().__init__()
         self.num_pitches = num_pitches
 
@@ -890,7 +890,7 @@ if __name__ == '__main__':
         'hidden_size': 384,
         'num_layers': 3,
         'batch_size_per_gpu': 256,
-        'epochs': 35,
+        'epochs': 50,
         'patience': 8,
         'lr': 1e-3,
         'warmup_epochs': 2,
