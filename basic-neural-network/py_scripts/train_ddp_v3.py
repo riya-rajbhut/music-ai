@@ -921,7 +921,7 @@ if __name__ == '__main__':
         'label_smoothing': 0.0,
         'seed': 53,
         'time_clip_upper_percentile': 99.5,
-        'years_to_use': [2004, 2006, 2008, 2009, 2011]
+        'years_to_use': None
     }
 
     gpus_available = torch.cuda.device_count()
