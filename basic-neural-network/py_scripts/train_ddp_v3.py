@@ -526,19 +526,19 @@ def main_worker(gpu, world_size, hparams):
                 # Integrated Backpropagation
                 train_loss = loss_pitch + (hparams['lambda_pc'] * loss_pc) + (hparams['lambda_oct'] * loss_oct) + hparams["time_loss_weight"] * (loss_step + loss_duration)
 
-                if is_main_process and len(train_debug_rows) < 3:
-                    sample_idx = torch.randint(0, y_pitch.size(0), (1,), device=gpu).item()
-                    probs = torch.softmax(preds["pitch"][sample_idx], dim=0)
-                    topk_probs, topk_indices = torch.topk(probs, k=3)
+#               if is_main_process and len(train_debug_rows) < 3:
+#                    sample_idx = torch.randint(0, y_pitch.size(0), (1,), device=gpu).item()
+#                    probs = torch.softmax(preds["pitch"][sample_idx], dim=0)
+#                    topk_probs, topk_indices = torch.topk(probs, k=3)
 
-                    train_debug_rows.append({
-                        "epoch": epoch + 1,
-                        "target_pitch": int(y_pitch[sample_idx].item()),
-                        "pred_pitch": int(predicted_pitch[sample_idx].item()),
-                        "input_sequence": x_pitch[sample_idx].detach().cpu().tolist(),
-                        "topk_indices": topk_indices.detach().cpu().tolist(),
-                        "topk_probs": topk_probs.detach().cpu().tolist(),
-                    })
+#                    train_debug_rows.append({
+#                        "epoch": epoch + 1,
+#                        "target_pitch": int(y_pitch[sample_idx].item()),
+#                        "pred_pitch": int(predicted_pitch[sample_idx].item()),
+#                        "input_sequence": x_pitch[sample_idx].detach().cpu().tolist(),
+#                        "topk_indices": topk_indices.detach().cpu().tolist(),
+#                        "topk_probs": topk_probs.detach().cpu().tolist(),
+#                    })
 
             scaler.scale(train_loss).backward()
             scaler.unscale_(optimizer)
@@ -746,40 +746,40 @@ def main_worker(gpu, world_size, hparams):
                     index=False,
                 )
 
-            print(
-                f"Epoch [{epoch+1}/{hparams['epochs']}] | "
-                f"Train Loss: {train_l:.4f} (Pitch: {train_p_l:.4f}, PC: {train_pc_l:.4f}, Oct: {train_oct_l:.4f}) | "
-                f"Val Loss: {val_l:.4f} (Pitch: {val_p_l:.4f}, PC: {val_pc_l:.4f}, Oct: {val_oct_l:.4f}) | "
-                f"Time: {time.time() - epoch_start:.1f}s"
-            )
+#            print(
+#                f"Epoch [{epoch+1}/{hparams['epochs']}] | "
+#                f"Train Loss: {train_l:.4f} (Pitch: {train_p_l:.4f}, PC: {train_pc_l:.4f}, Oct: {train_oct_l:.4f}) | "
+#                f"Val Loss: {val_l:.4f} (Pitch: {val_p_l:.4f}, PC: {val_pc_l:.4f}, Oct: {val_oct_l:.4f}) | "
+#                f"Time: {time.time() - epoch_start:.1f}s"
+#            )
 
-            for row in train_debug_rows:
-                print(
-                    format_pitch_prediction_row(
-                        split_name="Train",
-                        epoch_num=row["epoch"],
-                        input_sequence=row["input_sequence"],
-                        pred_pitch=row["pred_pitch"],
-                        target_pitch=row["target_pitch"],
-                        topk_indices=row["topk_indices"],
-                        topk_probs=row["topk_probs"],
-                    )
-                )
+#            for row in train_debug_rows:
+#                print(
+#                    format_pitch_prediction_row(
+#                        split_name="Train",
+#                        epoch_num=row["epoch"],
+#                        input_sequence=row["input_sequence"],
+#                        pred_pitch=row["pred_pitch"],
+#                        target_pitch=row["target_pitch"],
+#                        topk_indices=row["topk_indices"],
+#                        topk_probs=row["topk_probs"],
+#                    )
+#                )
 
-            for row in debug_rows[:3]:
-                print(
-                    format_pitch_prediction_row(
-                        split_name="Val",
-                        epoch_num=row["epoch"],
-                        input_sequence=row["input_sequence"],
-                        pred_pitch=row["pred_pitch"],
-                        target_pitch=row["target_pitch"],
-                        topk_indices=row["topk_indices"],
-                        topk_probs=row["topk_probs"],
-                    )
-                )
+#            for row in debug_rows[:3]:
+#                print(
+#                    format_pitch_prediction_row(
+#                        split_name="Val",
+#                        epoch_num=row["epoch"],
+#                        input_sequence=row["input_sequence"],
+#                        pred_pitch=row["pred_pitch"],
+#                        target_pitch=row["target_pitch"],
+#                        topk_indices=row["topk_indices"],
+#                        topk_probs=row["topk_probs"],
+#                    )
+#                )
 
-            if (epoch + 1) % 5 == 0:
+ #           if (epoch + 1) % 5 == 0:
                 print(
                     f"Epoch [{epoch+1}/{hparams['epochs']}] | "
                     f"LR: {current_lr:.6f} | "
@@ -910,7 +910,7 @@ if __name__ == '__main__':
         'hidden_size': 384,
         'num_layers': 3,
         'batch_size_per_gpu': 256,
-        'epochs': 50,
+        'epochs': 45,
         'patience': 8,
         'lr': 1e-3,
         'warmup_epochs': 2,
@@ -921,7 +921,7 @@ if __name__ == '__main__':
         'label_smoothing': 0.0,
         'seed': 53,
         'time_clip_upper_percentile': 99.5,
-        'years_to_use': [2004, 2006, 2008, 2009, 2011, 2013, 2018]
+        'years_to_use': None
     }
 
     gpus_available = torch.cuda.device_count()
