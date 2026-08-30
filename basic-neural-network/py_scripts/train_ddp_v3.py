@@ -910,7 +910,7 @@ if __name__ == '__main__':
         'hidden_size': 384,
         'num_layers': 3,
         'batch_size_per_gpu': 256,
-        'epochs': 40,
+        'epochs': 50,
         'patience': 8,
         'lr': 1e-3,
         'warmup_epochs': 2,
@@ -921,7 +921,7 @@ if __name__ == '__main__':
         'label_smoothing': 0.0,
         'seed': 53,
         'time_clip_upper_percentile': 99.5,
-        'years_to_use': None
+        'years_to_use': [2004, 2006, 2008, 2009, 2011, 2013, 2018]
     }
 
     gpus_available = torch.cuda.device_count()
