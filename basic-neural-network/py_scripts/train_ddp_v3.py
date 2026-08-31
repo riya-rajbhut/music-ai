@@ -907,10 +907,10 @@ def main_worker(gpu, world_size, hparams):
 if __name__ == '__main__':
     hyperparameters = {
         'seq_len': 128,
-        'hidden_size': 384,
+        'hidden_size': 512,
         'num_layers': 3,
         'batch_size_per_gpu': 256,
-        'epochs': 45,
+        'epochs': 40,
         'patience': 8,
         'lr': 1e-3,
         'warmup_epochs': 2,
