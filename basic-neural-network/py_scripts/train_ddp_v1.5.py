@@ -309,7 +309,7 @@ def main_worker(gpu, world_size, hparams):
         wandb.login(key="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")
         wandb.init(
             project="music-rnn-ddp",
-            entity="riya-rajbhut-student-org",
+            entity="riya.rajbhut@gmail.com",
             config=hparams
         )
         weights_history = []
