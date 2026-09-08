@@ -926,6 +926,10 @@ def main_worker(gpu, world_size, hparams):
                         topk_probs=row["topk_probs"],
                     )
                 )
+            wandb.log({"test/pitch_accuracy": correct_pitch / total_samples})
+
+        wandb.finish()
+
 
     dist.destroy_process_group()
 
