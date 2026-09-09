@@ -281,7 +281,7 @@ class OptimizedMusicRNN(nn.Module):
         )
         
         # ADDED: Explicit initialization for GRU weights to maximize accuracy
-        self._initialize_gru_weights()
+       # self._initialize_gru_weights()
 
     def _initialize_gru_weights(self):
         """Applies Orthogonal and Xavier initialization to GRU weights."""
@@ -531,6 +531,9 @@ def main_worker(gpu, world_size, hparams):
         model.train()
 
         running_loss, running_pitch_loss, running_pc_loss, running_oct_loss = 0.0, 0.0, 0.0, 0.0
+        running_grad_norm = 0.0
+        grad_norm_max = 0.0
+        nonfinite_grad_batches = 0
         train_correct, train_total = 0, 0
         train_debug_rows = []
 
@@ -576,9 +579,16 @@ def main_worker(gpu, world_size, hparams):
 
             scaler.scale(train_loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+
+            grad_norm_val = grad_norm.item()
+            if torch.isfinite(grad_norm):
+                running_grad_norm += grad_norm_val
+                grad_norm_max = max(grad_norm_max, grad_norm_val)
+            else:
+                nonfinite_grad_batches += 1   # scaler.step() silently skips these — worth counting
 
             running_loss += train_loss.item()
             running_pitch_loss += loss_pitch.item()
@@ -793,6 +803,9 @@ def main_worker(gpu, world_size, hparams):
                 "val/pitch_class_accuracy": val_pc_acc,
                 "val/octave_accuracy": val_oct_acc,
                 "val/pure_octave_error_rate": val_pure_oct_err_rate,
+                "train/grad_norm_mean": running_grad_norm / len(train_loader),
+                "train/grad_norm_max": grad_norm_max,
+                "train/nonfinite_grad_batches": nonfinite_grad_batches,
             }
 
             wandb.log(log_payload, step=epoch + 1)
@@ -837,19 +850,19 @@ def main_worker(gpu, world_size, hparams):
 #                )
 
  #           if (epoch + 1) % 5 == 0:
-                print(
-                    f"Epoch [{epoch+1}/{hparams['epochs']}] | "
-                    f"LR: {current_lr:.6f} | "
-                    f"Train Loss: {train_l:.4f} | Train Acc: {train_acc*100:.2f}% | "
-                    f"Val Loss: {val_l:.4f} | Val Acc: {val_acc*100:.2f}% | "
-                    f"Time: {time.time() - epoch_start:.1f}s"
-                )
-                print(
-                    f"Val Decomposed Accuracy | "
-                    f"Pitch Class Acc: {val_pc_acc*100:.2f}% | "
-                    f"Octave Acc: {val_oct_acc*100:.2f}% | "
-                    f"Pure Octave Error Rate (Right PC, Wrong Oct): {val_pure_oct_err_rate*100:.2f}%"
-                )
+            print(
+                f"Epoch [{epoch+1}/{hparams['epochs']}] | "
+                f"LR: {current_lr:.6f} | "
+                f"Train Loss: {train_l:.4f} | Train Acc: {train_acc*100:.2f}% | "
+                f"Val Loss: {val_l:.4f} | Val Acc: {val_acc*100:.2f}% | "
+                f"Time: {time.time() - epoch_start:.1f}s"
+            )
+            print(
+                f"Val Decomposed Accuracy | "
+                f"Pitch Class Acc: {val_pc_acc*100:.2f}% | "
+                f"Octave Acc: {val_oct_acc*100:.2f}% | "
+                f"Pure Octave Error Rate (Right PC, Wrong Oct): {val_pure_oct_err_rate*100:.2f}%"
+            )
 
             if val_p_l < best_val_pitch_loss:
                 best_val_pitch_loss = val_p_l
@@ -866,6 +879,7 @@ def main_worker(gpu, world_size, hparams):
         )
         dist.all_reduce(stop_signal, op=dist.ReduceOp.SUM)
         if stop_signal.item() > 0:
+            print("\n --- Early Stopping Triggered ---")
             break
 
     # --- Test Evaluation ---
@@ -942,8 +956,8 @@ if __name__ == '__main__':
         'batch_size_per_gpu': 256,
         'epochs': 40,
         'patience': 8,
-        'lr': 1e-3,
-        'warmup_epochs': 2,
+        'lr': 3e-4,
+        'warmup_epochs': 4,
         'weight_decay': 1e-4,
         'time_loss_weight': 0.5,
         'lambda_pc': 0.1,       # Tuning parameter for Pitch Class auxiliary loss
