@@ -402,9 +402,8 @@ def main_worker(gpu, world_size, hparams):
                 flat_oct_logits = preds['oct_logits'].reshape(-1, 11)
 
                 predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
-                train_correct += (predicted_pitch == flat_y).sum().item()
                 train_correct_t += (predicted_pitch == flat_y).sum()
-
+                train_total += flat_y.size(0)
 
                 loss_pitch = criterion_pitch(flat_pitch_logits, flat_y)
                 loss_pc = criterion_pitch(flat_pc_logits, flat_y % 12) 
