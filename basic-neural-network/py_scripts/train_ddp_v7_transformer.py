@@ -379,8 +379,12 @@ def main_worker(gpu, world_size, hparams):
         train_sampler.set_epoch(epoch)
         model.train()
 
-        running_loss, running_pitch_loss, running_pc_loss, running_oct_loss = 0.0, 0.0, 0.0, 0.0
-        train_correct, train_total = 0, 0
+        running_loss_t = torch.zeros((), device=gpu, dtype=torch.float64)
+        running_pitch_loss_t = torch.zeros((), device=gpu, dtype=torch.float64)
+        running_pc_loss_t = torch.zeros((), device=gpu, dtype=torch.float64)
+        running_oct_loss_t = torch.zeros((), device=gpu, dtype=torch.float64)
+        train_correct_t = torch.zeros((), device=gpu, dtype=torch.float64)
+        train_total = 0
 
         for batch_idx, (x_pitch, y_pitch) in enumerate(train_loader):
             x_pitch = x_pitch.cuda(gpu, non_blocking=True)
@@ -399,7 +403,8 @@ def main_worker(gpu, world_size, hparams):
 
                 predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
                 train_correct += (predicted_pitch == flat_y).sum().item()
-                train_total += flat_y.size(0)
+                train_correct_t += (predicted_pitch == flat_y).sum()
+
 
                 loss_pitch = criterion_pitch(flat_pitch_logits, flat_y)
                 loss_pc = criterion_pitch(flat_pc_logits, flat_y % 12) 
@@ -413,10 +418,21 @@ def main_worker(gpu, world_size, hparams):
             scaler.step(optimizer)
             scaler.update()
 
-            running_loss += train_loss.item()
-            running_pitch_loss += loss_pitch.item()
-            running_pc_loss += loss_pc.item()
-            running_oct_loss += loss_oct.item()
+            # .detach() only — stays on GPU, no CPU/GPU sync happens here
+
+            running_loss_t += train_loss.detach()
+            running_pitch_loss_t += loss_pitch.detach()
+            running_pc_loss_t += loss_pc.detach()
+            running_oct_loss_t += loss_oct.detach()
+
+        # Single sync point for the whole epoch's training stats, instead of one per batch
+        running_loss = running_loss_t.item()
+        running_pitch_loss = running_pitch_loss_t.item()
+        running_pc_loss = running_pc_loss_t.item()
+        running_oct_loss = running_oct_loss_t.item()
+        train_correct = train_correct_t.item()
+
+
 
         # Validation Loop
         model.eval()
