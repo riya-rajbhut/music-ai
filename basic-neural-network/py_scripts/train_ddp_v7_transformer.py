@@ -3,6 +3,7 @@ import pathlib
 import pickle
 import collections
 import time
+import random
 import warnings
 
 warnings.filterwarnings('ignore', message='pkg_resources is deprecated as an API')
@@ -29,7 +30,6 @@ from torch.hub import download_url_to_file
 # ==========================================
 
 def download_maestro_dataset(dest_dir: str = 'data') -> pathlib.Path:
-    """Downloads and unzips the MAESTRO MIDI dataset if not present."""
     url = "https://storage.googleapis.com/magentadata/datasets/maestro/v3.0.0/maestro-v3.0.0-midi.zip"
     base_path = pathlib.Path(dest_dir)
     base_path.mkdir(parents=True, exist_ok=True)
@@ -47,13 +47,11 @@ def download_maestro_dataset(dest_dir: str = 'data') -> pathlib.Path:
 
 
 def convert_midi_to_notes(midi_file_path: str) -> pd.DataFrame:
-    """Parses a MIDI file into note pitches chronologically."""
     midi_data = pm.PrettyMIDI(str(midi_file_path))
     if not midi_data.instruments:
         return pd.DataFrame()
 
     instrument = midi_data.instruments[0]
-    # Keep sorting chronological to ensure valid sequential sequences
     sorted_notes = sorted(instrument.notes, key=lambda note: (note.start, note.pitch))
     if not sorted_notes:
         return pd.DataFrame()
@@ -63,7 +61,6 @@ def convert_midi_to_notes(midi_file_path: str) -> pd.DataFrame:
 
 
 def convert_all_songs_to_notes(dataset_root: pathlib.Path, years_to_use=None) -> list:
-    """Parses .midi files from selected year folders into numpy arrays."""
     if years_to_use is None:
         all_midi_files = list(dataset_root.glob('**/*.midi'))
     else:
@@ -84,9 +81,7 @@ def convert_all_songs_to_notes(dataset_root: pathlib.Path, years_to_use=None) ->
 
 
 def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool, years_to_use=None) -> list:
-    """Handles cached dataset reading and writing for multi-GPU safety."""
-    # Bumped cache version to force re-creation without time features
-    cache_version = "v4_pitch_only" 
+    cache_version = "v5_causal_seq2seq" 
     year_tag = "all" if years_to_use is None else "_".join(map(str, years_to_use))
     cache_file = dataset_root / f'converted_notes_{cache_version}_{year_tag}.pkl'
 
@@ -121,47 +116,50 @@ def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool,
 # ==========================================
 
 class BasicRNNForMusic(data.Dataset):
-    """Sliding window dataset for sequence prediction (pitch only)."""
-
-    def __init__(self, song_note_arrays, seq_len=64, augment=False, hop_length=1):
+    """Causal sequence-to-sequence dataset."""
+    def __init__(self, song_note_arrays, seq_len=128, augment=False, hop_length=None):
         self.seq_len = seq_len
         self.augment = augment
+        # Hop length defaults to seq_len for non-overlapping contiguous chunks
+        self.hop_length = hop_length if hop_length is not None else seq_len
         self.song_pitches = []
         self.index_map = []
         
         for song_notes in song_note_arrays:
             notes_array = np.asarray(song_notes, dtype=np.float32)
+            # Need seq_len + 1 notes to form (input, target) shifted by 1 position
             if len(notes_array) <= self.seq_len:
                 continue
 
             pitches = notes_array[:, 0].astype(np.int64)
-
             song_idx = len(self.song_pitches)
             self.song_pitches.append(torch.tensor(pitches, dtype=torch.long))
-            # Added hop_length here to reduce redundant overlaps
-            self.index_map.extend((song_idx, start_idx) for start_idx in range(0, len(pitches) - self.seq_len, hop_length))
+            
+            self.index_map.extend(
+                (song_idx, start_idx) 
+                for start_idx in range(0, len(pitches) - self.seq_len, self.hop_length)
+            )
 
     def __len__(self):
         return len(self.index_map)
 
     def __getitem__(self, idx):
         song_idx, start_idx = self.index_map[idx]
-        end_idx = start_idx + self.seq_len
+        end_idx = start_idx + self.seq_len + 1
         
-        # Removed the automatic .clone() to save CPU memory bandwidth
-        pitch_seq = self.song_pitches[song_idx][start_idx:end_idx]
-        target_pitch = self.song_pitches[song_idx][end_idx]
+        full_seq = self.song_pitches[song_idx][start_idx:end_idx]
         
         if self.augment:
-            shift = torch.randint(-5, 6, (1,)).item()
-            # Only clone and clamp if we are actively mutating the data
-            pitch_seq = (pitch_seq.clone() + shift).clamp_(0, 127)
-            target_pitch = (target_pitch.clone() + shift).clamp_(0, 127)
+            shift = random.randint(-5, 5)
+            full_seq = (full_seq + shift).clamp_(0, 127)
 
-        return pitch_seq, target_pitch
+        input_seq = full_seq[:-1]   # Shape: (seq_len,)
+        target_seq = full_seq[1:]   # Shape: (seq_len,)
+
+        return input_seq, target_seq
+
 
 def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
-    """Splits full songs into train, validation, and test splits."""
     song_indices = np.random.default_rng(seed).permutation(len(song_note_arrays))
     train_cutoff = int(len(song_indices) * train_ratio)
     val_cutoff = int(len(song_indices) * (train_ratio + val_ratio))
@@ -178,7 +176,7 @@ def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
 # ==========================================
 
 class OptimizedMusicTransformer(nn.Module):
-    """Predicts next pitch using self-attention and octave decomposition."""
+    """Predicts all next pitches in sequence using causal self-attention."""
     def __init__(self, num_pitches=128, pitch_embed_dim=128, hidden_size=512, num_layers=3, num_heads=8, seq_len=128, dropout_rate=0.1):
         super().__init__()
         self.num_pitches = num_pitches
@@ -186,29 +184,23 @@ class OptimizedMusicTransformer(nn.Module):
         pc_dim = (pitch_embed_dim * 3) // 4
         oct_dim = pitch_embed_dim - pc_dim
         
-        # 1. Pitch Embeddings
         self.pitch_class_embed = nn.Embedding(num_embeddings=12, embedding_dim=pc_dim)
         self.octave_embed = nn.Embedding(num_embeddings=11, embedding_dim=oct_dim)
-        
-        # 2. Positional Embeddings (Crucial for Transformers to know note order)
         self.pos_embed = nn.Embedding(num_embeddings=seq_len, embedding_dim=pitch_embed_dim)
         self.input_norm = nn.LayerNorm(pitch_embed_dim)
-        
-        # Map embedding dim to transformer hidden size
         self.embed_proj = nn.Linear(pitch_embed_dim, hidden_size)
         
-        # 3. Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_size,
             nhead=num_heads,
             dim_feedforward=hidden_size * 4,
             dropout=dropout_rate,
             activation='gelu',
-            batch_first=True
+            batch_first=True,
+            norm_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # 4. Feature Extractors (Kept identical for compatibility with your DDP loop)
         self.pc_feature_extractor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
@@ -220,7 +212,6 @@ class OptimizedMusicTransformer(nn.Module):
             nn.Dropout(dropout_rate)
         )
         
-        # 5. Auxiliary Heads & Fusion Layer
         self.pc_head = nn.Linear(hidden_size, 12)
         self.oct_head = nn.Linear(hidden_size, 11)
         self.fusion_layer = nn.Linear(hidden_size * 2, num_pitches)
@@ -235,7 +226,6 @@ class OptimizedMusicTransformer(nn.Module):
         oct_embeds = self.octave_embed(octave)
         pitch_embeds = torch.cat([pc_embeds, oct_embeds], dim=2)
         
-        # Create position indices and add positional embeddings
         positions = torch.arange(seq_length, device=pitch_seq.device).unsqueeze(0).expand(batch_size, seq_length)
         pos_embeds = self.pos_embed(positions)
         
@@ -243,15 +233,13 @@ class OptimizedMusicTransformer(nn.Module):
         x = self.input_norm(x)
         x = self.embed_proj(x)
         
-        # Pass through the Transformer
-        transformer_out = self.transformer(x)
+        # Upper-triangular causal mask prevents position t from attending to t+1...T
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_length, device=pitch_seq.device)
+        transformer_out = self.transformer(x, mask=causal_mask, is_causal=True)
         
-        # Extract the final token's output to predict the next note
-        last_out = transformer_out[:, -1, :]
-        
-        # Compute features and logits exactly as before
-        pc_features = self.pc_feature_extractor(last_out)
-        oct_features = self.oct_feature_extractor(last_out)
+        # Full Sequence Output: (Batch, Seq_Len, Hidden)
+        pc_features = self.pc_feature_extractor(transformer_out)
+        oct_features = self.oct_feature_extractor(transformer_out)
         
         pc_logits = self.pc_head(pc_features)
         oct_logits = self.oct_head(oct_features)
@@ -260,43 +248,17 @@ class OptimizedMusicTransformer(nn.Module):
         joint_logits = self.fusion_layer(combined_features)
         
         return {
-            'pitch': joint_logits,
-            'pc_logits': pc_logits,
-            'oct_logits': oct_logits
+            'pitch': joint_logits,      # (B, T, 128)
+            'pc_logits': pc_logits,    # (B, T, 12)
+            'oct_logits': oct_logits    # (B, T, 11)
         }
 
-def pitch_to_label(pitch_value):
-    """Formats a MIDI pitch number as '<num>(<note>)', e.g. '60(C4)'."""
-    pitch_int = int(pitch_value)
-    return f"{pitch_int}({pm.note_number_to_name(pitch_int)})"
 
-
-def format_pitch_sequence(pitch_sequence):
-    """Formats a full pitch sequence with MIDI numbers and note names."""
-    return "[" + ", ".join(pitch_to_label(p) for p in pitch_sequence) + "]"
-
-
-def format_topk_predictions(topk_indices, topk_probs):
-    """Formats top-k pitch predictions with probabilities."""
-    return "[" + ", ".join(
-        f"{pitch_to_label(pitch)} ({prob:.3f})"
-        for pitch, prob in zip(topk_indices, topk_probs)
-    ) + "]"
-
-
-def format_pitch_prediction_row(split_name, epoch_num, input_sequence, pred_pitch, target_pitch, topk_indices, topk_probs):
-    """Creates a readable console log row for one sample prediction."""
-    return (
-        f"{split_name} Sample | Epoch {epoch_num} | "
-        f"Input: {format_pitch_sequence(input_sequence)} -> "
-        f"Pred Pitch: {pitch_to_label(pred_pitch)} | "
-        f"Target Pitch: {pitch_to_label(target_pitch)} | "
-        f"Top-k: {format_topk_predictions(topk_indices, topk_probs)}"
-    )
-
+# ==========================================
+# 4. MAIN WORKER & TRAINING LOOP
+# ==========================================
 
 def compute_pitch_frequency_bucket_ids(song_note_arrays):
-    """Buckets pitches into rare / medium / common using train-set frequency tertiles."""
     pitch_counts = np.zeros(128, dtype=np.int64)
     for song_notes in song_note_arrays:
         notes_array = np.asarray(song_notes, dtype=np.float32)
@@ -320,25 +282,7 @@ def compute_pitch_frequency_bucket_ids(song_note_arrays):
     return bucket_ids, bucket_names, pitch_counts
 
 
-def summarize_top_pitch_counts(counts, top_n=5):
-    """Formats the most frequent pitches in a count vector."""
-    counts_tensor = torch.as_tensor(counts, dtype=torch.float64)
-    total = counts_tensor.sum().item()
-    if total <= 0:
-        return "None"
-
-    top_n = min(top_n, counts_tensor.numel())
-    top_vals, top_idx = torch.topk(counts_tensor, k=top_n)
-    entries = []
-    for pitch, count in zip(top_idx.tolist(), top_vals.tolist()):
-        if count <= 0:
-            continue
-        entries.append(f"{pitch_to_label(pitch)}: {100.0 * count / total:.1f}%")
-    return ", ".join(entries) if entries else "None"
-
-
 def summarize_pitch_confusions(confusion_matrix, top_n=5):
-    """Formats the most common wrong target->prediction pitch confusions."""
     confusion = torch.as_tensor(confusion_matrix, dtype=torch.int64).clone()
     if confusion.numel() == 0:
         return "None"
@@ -356,49 +300,29 @@ def summarize_pitch_confusions(confusion_matrix, top_n=5):
             continue
         target_pitch = flat_idx // 128
         predicted_pitch = flat_idx % 128
-        entries.append(f"{pitch_to_label(target_pitch)} -> {pitch_to_label(predicted_pitch)}: {int(count)}")
+        entries.append(f"{target_pitch}->{predicted_pitch}: {int(count)}")
     return ", ".join(entries) if entries else "None"
 
 
-def format_named_accuracy_line(label, names, correct_counts, total_counts):
-    """Formats per-bucket accuracies for logging."""
-    entries = []
-    for name, correct, total in zip(names, correct_counts, total_counts):
-        correct_value = float(correct)
-        total_value = float(total)
-        accuracy = 100.0 * correct_value / total_value if total_value > 0 else 0.0
-        entries.append(f"{name}: {accuracy:.2f}% ({int(correct_value)}/{int(total_value)})")
-    return f"{label} | " + " | ".join(entries)
-
-
-# ==========================================
-# 4. MAIN WORKER & TRAINING LOOP
-# ==========================================
-
 def main_worker(gpu, world_size, hparams):
-    """Distributed worker routine per GPU."""
     rank = gpu
     dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
     torch.cuda.set_device(gpu)
     torch.backends.cudnn.benchmark = True
     is_main_process = (rank == 0)
 
-    # --- Initialize W&B ---
     if is_main_process:
-        wandb_api_key = "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" #os.environ.get("WANDB_API_KEY")
+        wandb_api_key = "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"
         if wandb_api_key:
             wandb.login(key=wandb_api_key)
         else:
-            wandb.login()  # falls back to cached login / interactive prompt
+            wandb.login()
         wandb.init(
             project="music-rnn-ddp",
             entity="riya-rajbhut-student",
             config=hparams
         )
-        weights_history = []
-        sampled_epochs = []
 
-    # --- Data Loading ---
     dataset_root = pathlib.Path('data/maestro-v3.0.0')
     if is_main_process:
         download_maestro_dataset()
@@ -407,14 +331,12 @@ def main_worker(gpu, world_size, hparams):
     converted_notes = load_or_create_note_cache(dataset_root, is_main_process, hparams['years_to_use'])
     train_notes, val_notes, test_notes = split_song_arrays(converted_notes, seed=hparams['seed'])
 
-    pitch_bucket_ids_np, pitch_bucket_names, _ = compute_pitch_frequency_bucket_ids(train_notes)
+    pitch_bucket_ids_np, _, _ = compute_pitch_frequency_bucket_ids(train_notes)
     pitch_bucket_ids_t = torch.tensor(pitch_bucket_ids_np, device=gpu, dtype=torch.long)
-    interval_bucket_names = ["Repeat", "Step<=2", "Leap3-5", "Leap6-12", "Leap>12"]
 
-# Pass hop_length=3 to drastically reduce epoch time without hurting convergence
-    train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], augment=True, hop_length=3)
-    val_dataset = BasicRNNForMusic(val_notes, seq_len=hparams['seq_len'], augment=False, hop_length=3)
-    test_dataset = BasicRNNForMusic(test_notes, seq_len=hparams['seq_len'], augment=False, hop_length=3)
+    train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], augment=True, hop_length=hparams['seq_len'])
+    val_dataset = BasicRNNForMusic(val_notes, seq_len=hparams['seq_len'], augment=False, hop_length=hparams['seq_len'])
+    test_dataset = BasicRNNForMusic(test_notes, seq_len=hparams['seq_len'], augment=False, hop_length=hparams['seq_len'])
 
     if is_main_process:
         print(f"Dataset split — Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
@@ -422,12 +344,11 @@ def main_worker(gpu, world_size, hparams):
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
-    train_loader = data.DataLoader(train_dataset, batch_size=hparams['batch_size_per_gpu'], sampler=train_sampler, pin_memory=True, num_workers=2, drop_last=True, persistent_workers=True)
-    val_loader = data.DataLoader(val_dataset, batch_size=hparams['batch_size_per_gpu'], sampler=val_sampler, pin_memory=True, num_workers=2, persistent_workers=True)
-    test_loader = data.DataLoader(test_dataset, batch_size=hparams['batch_size_per_gpu'], pin_memory=True, num_workers=2, shuffle=False)
+    num_workers = min(8, max(4, (os.cpu_count() or 4) // world_size))
+    train_loader = data.DataLoader(train_dataset, batch_size=hparams['batch_size_per_gpu'], sampler=train_sampler, pin_memory=True, num_workers=num_workers, drop_last=True, persistent_workers=True)
+    val_loader = data.DataLoader(val_dataset, batch_size=hparams['batch_size_per_gpu'], sampler=val_sampler, pin_memory=True, num_workers=num_workers, persistent_workers=True)
+    test_loader = data.DataLoader(test_dataset, batch_size=hparams['batch_size_per_gpu'], pin_memory=True, num_workers=num_workers, shuffle=False)
 
-    # --- Model Setup ---
-# --- Model Setup ---
     model = OptimizedMusicTransformer(
         hidden_size=hparams['hidden_size'], 
         num_layers=hparams['num_layers'],
@@ -436,8 +357,6 @@ def main_worker(gpu, world_size, hparams):
     model = DDP(model, device_ids=[gpu])
 
     criterion_pitch = nn.CrossEntropyLoss(label_smoothing=hparams['label_smoothing'])
-
-# Add fused=True for a faster CUDA execution of the weight updates
     optimizer = optim.AdamW(model.parameters(), lr=hparams['lr'], weight_decay=hparams['weight_decay'], fused=True)
 
     warmup_epochs = hparams['warmup_epochs']
@@ -449,23 +368,23 @@ def main_worker(gpu, world_size, hparams):
 
     artifacts_root = pathlib.Path("artifacts")
     best_checkpoint_path = artifacts_root / "best_model.pt"
-    history_csv_path = artifacts_root / "history.csv"
     if is_main_process:
         artifacts_root.mkdir(parents=True, exist_ok=True)
 
     best_val_pitch_loss = float("inf")
     epochs_without_improvement = 0
-    history_rows = []
 
-    # --- Training Loop ---
     for epoch in range(hparams["epochs"]):
         epoch_start = time.time()
         train_sampler.set_epoch(epoch)
         model.train()
 
-        running_loss, running_pitch_loss, running_pc_loss, running_oct_loss = 0.0, 0.0, 0.0, 0.0
-        train_correct, train_total = 0, 0
-        train_debug_rows = []
+        running_loss_t = torch.zeros((), device=gpu, dtype=torch.float64)
+        running_pitch_loss_t = torch.zeros((), device=gpu, dtype=torch.float64)
+        running_pc_loss_t = torch.zeros((), device=gpu, dtype=torch.float64)
+        running_oct_loss_t = torch.zeros((), device=gpu, dtype=torch.float64)
+        train_correct_t = torch.zeros((), device=gpu, dtype=torch.float64)
+        train_total = 0
 
         for batch_idx, (x_pitch, y_pitch) in enumerate(train_loader):
             x_pitch = x_pitch.cuda(gpu, non_blocking=True)
@@ -475,44 +394,53 @@ def main_worker(gpu, world_size, hparams):
 
             with autocast("cuda"):
                 preds = model(x_pitch)
-                predicted_pitch = torch.argmax(preds["pitch"], dim=1)
-
-                train_correct += (predicted_pitch == y_pitch).sum().item()
-                train_total += y_pitch.size(0)
-
-                # Primary and Auxiliary Losses
-                loss_pitch = criterion_pitch(preds["pitch"], y_pitch)
-                loss_pc = criterion_pitch(preds["pc_logits"], y_pitch % 12) 
-                loss_oct = criterion_pitch(preds["oct_logits"], torch.clamp(y_pitch // 12, 0, 10))
                 
-                # Integrated Backpropagation (Time loss removed)
+                # Flatten sequence tokens: (B, T, C) -> (B*T, C)
+                flat_y = y_pitch.reshape(-1)
+                flat_pitch_logits = preds['pitch'].reshape(-1, 128)
+                flat_pc_logits = preds['pc_logits'].reshape(-1, 12)
+                flat_oct_logits = preds['oct_logits'].reshape(-1, 11)
+
+                predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
+                train_correct += (predicted_pitch == flat_y).sum().item()
+                train_correct_t += (predicted_pitch == flat_y).sum()
+
+
+                loss_pitch = criterion_pitch(flat_pitch_logits, flat_y)
+                loss_pc = criterion_pitch(flat_pc_logits, flat_y % 12) 
+                loss_oct = criterion_pitch(flat_oct_logits, torch.clamp(flat_y // 12, 0, 10))
+                
                 train_loss = loss_pitch + (hparams['lambda_pc'] * loss_pc) + (hparams['lambda_oct'] * loss_oct)
 
             scaler.scale(train_loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             scaler.step(optimizer)
             scaler.update()
 
-            running_loss += train_loss.item()
-            running_pitch_loss += loss_pitch.item()
-            running_pc_loss += loss_pc.item()
-            running_oct_loss += loss_oct.item()
+            # .detach() only — stays on GPU, no CPU/GPU sync happens here
 
-        # Evaluation
+            running_loss_t += train_loss.detach()
+            running_pitch_loss_t += loss_pitch.detach()
+            running_pc_loss_t += loss_pc.detach()
+            running_oct_loss_t += loss_oct.detach()
+
+        # Single sync point for the whole epoch's training stats, instead of one per batch
+        running_loss = running_loss_t.item()
+        running_pitch_loss = running_pitch_loss_t.item()
+        running_pc_loss = running_pc_loss_t.item()
+        running_oct_loss = running_oct_loss_t.item()
+        train_correct = train_correct_t.item()
+
+
+
+        # Validation Loop
         model.eval()
         val_loss_tot, val_loss_p, val_loss_pc, val_loss_oct = 0.0, 0.0, 0.0, 0.0
         val_correct, val_total = 0, 0
         val_pc_correct, val_oct_correct, val_pure_octave_errors = 0, 0, 0
-        debug_rows = []
         val_topk_correct = torch.zeros(3, device=gpu, dtype=torch.float64)
         val_confusion = torch.zeros((128, 128), device=gpu, dtype=torch.int64)
-        val_pred_counts = torch.zeros(128, device=gpu, dtype=torch.int64)
-        val_target_counts = torch.zeros(128, device=gpu, dtype=torch.int64)
-        val_bucket_correct = torch.zeros(3, device=gpu, dtype=torch.float64)
-        val_bucket_total = torch.zeros(3, device=gpu, dtype=torch.float64)
-        val_interval_correct = torch.zeros(5, device=gpu, dtype=torch.float64)
-        val_interval_total = torch.zeros(5, device=gpu, dtype=torch.float64)
 
         with torch.no_grad():
             for x_pitch, y_pitch in val_loader:
@@ -521,55 +449,37 @@ def main_worker(gpu, world_size, hparams):
 
                 with autocast("cuda"):
                     preds = model(x_pitch)
-                    predicted_pitch = torch.argmax(preds["pitch"], dim=1)
-                    top5_indices = torch.topk(preds["pitch"], k=5, dim=1).indices
-
-                    val_correct += (predicted_pitch == y_pitch).sum().item()
-                    val_total += y_pitch.size(0)
                     
-                    # Decomposed Pitch Analysis Metrics
-                    y_pc = y_pitch % 12
+                    flat_y = y_pitch.reshape(-1)
+                    flat_pitch_logits = preds['pitch'].reshape(-1, 128)
+                    flat_pc_logits = preds['pc_logits'].reshape(-1, 12)
+                    flat_oct_logits = preds['oct_logits'].reshape(-1, 11)
+
+                    predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
+                    top5_indices = torch.topk(flat_pitch_logits, k=5, dim=1).indices
+
+                    val_correct += (predicted_pitch == flat_y).sum().item()
+                    val_total += flat_y.size(0)
+                    
+                    y_pc = flat_y % 12
                     pred_pc = predicted_pitch % 12
-                    y_oct = y_pitch // 12
+                    y_oct = flat_y // 12
                     pred_oct = predicted_pitch // 12
                     
                     val_pc_correct += (pred_pc == y_pc).sum().item()
                     val_oct_correct += (pred_oct == y_oct).sum().item()
-                    # Pure octave error: Pitch class is right, but absolute pitch is wrong
-                    val_pure_octave_errors += ((pred_pc == y_pc) & (predicted_pitch != y_pitch)).sum().item()
+                    val_pure_octave_errors += ((pred_pc == y_pc) & (predicted_pitch != flat_y)).sum().item()
 
-                    val_topk_correct[0] += (top5_indices[:, :1] == y_pitch.unsqueeze(1)).any(dim=1).sum().item()
-                    val_topk_correct[1] += (top5_indices[:, :3] == y_pitch.unsqueeze(1)).any(dim=1).sum().item()
-                    val_topk_correct[2] += (top5_indices == y_pitch.unsqueeze(1)).any(dim=1).sum().item()
+                    val_topk_correct[0] += (top5_indices[:, :1] == flat_y.unsqueeze(1)).any(dim=1).sum().item()
+                    val_topk_correct[1] += (top5_indices[:, :3] == flat_y.unsqueeze(1)).any(dim=1).sum().item()
+                    val_topk_correct[2] += (top5_indices == flat_y.unsqueeze(1)).any(dim=1).sum().item()
 
-                    val_pred_counts += torch.bincount(predicted_pitch, minlength=128)
-                    val_target_counts += torch.bincount(y_pitch, minlength=128)
-                    confusion_indices = y_pitch * 128 + predicted_pitch
+                    confusion_indices = flat_y * 128 + predicted_pitch
                     val_confusion += torch.bincount(confusion_indices, minlength=128 * 128).reshape(128, 128)
 
-                    batch_bucket_ids = pitch_bucket_ids_t[y_pitch]
-                    valid_bucket_mask = batch_bucket_ids >= 0
-                    if valid_bucket_mask.any():
-                        valid_bucket_ids = batch_bucket_ids[valid_bucket_mask]
-                        val_bucket_total += torch.bincount(valid_bucket_ids, minlength=3).to(torch.float64)
-                        correct_bucket_ids = valid_bucket_ids[(predicted_pitch[valid_bucket_mask] == y_pitch[valid_bucket_mask])]
-                        if correct_bucket_ids.numel() > 0:
-                            val_bucket_correct += torch.bincount(correct_bucket_ids, minlength=3).to(torch.float64)
-
-                    interval_sizes = (y_pitch - x_pitch[:, -1]).abs()
-                    interval_bucket_ids = torch.full_like(interval_sizes, 4)
-                    interval_bucket_ids[interval_sizes == 0] = 0
-                    interval_bucket_ids[(interval_sizes > 0) & (interval_sizes <= 2)] = 1
-                    interval_bucket_ids[(interval_sizes >= 3) & (interval_sizes <= 5)] = 2
-                    interval_bucket_ids[(interval_sizes >= 6) & (interval_sizes <= 12)] = 3
-                    val_interval_total += torch.bincount(interval_bucket_ids, minlength=5).to(torch.float64)
-                    correct_interval_ids = interval_bucket_ids[predicted_pitch == y_pitch]
-                    if correct_interval_ids.numel() > 0:
-                        val_interval_correct += torch.bincount(correct_interval_ids, minlength=5).to(torch.float64)
-
-                    loss_pitch = criterion_pitch(preds["pitch"], y_pitch)
-                    loss_pc = criterion_pitch(preds["pc_logits"], y_pitch % 12)
-                    loss_oct = criterion_pitch(preds["oct_logits"], torch.clamp(y_pitch // 12, 0, 10))
+                    loss_pitch = criterion_pitch(flat_pitch_logits, flat_y)
+                    loss_pc = criterion_pitch(flat_pc_logits, flat_y % 12)
+                    loss_oct = criterion_pitch(flat_oct_logits, torch.clamp(flat_y // 12, 0, 10))
                     
                     val_loss = loss_pitch + (hparams['lambda_pc'] * loss_pc) + (hparams['lambda_oct'] * loss_oct)
 
@@ -577,20 +487,6 @@ def main_worker(gpu, world_size, hparams):
                     val_loss_p += loss_pitch.item()
                     val_loss_pc += loss_pc.item()
                     val_loss_oct += loss_oct.item()
-
-                if is_main_process and len(debug_rows) < 10:
-                    sample_idx = torch.randint(0, y_pitch.size(0), (1,), device=gpu).item()
-                    probs = torch.softmax(preds["pitch"][sample_idx], dim=0)
-                    topk_probs, topk_indices = torch.topk(probs, k=3)
-
-                    debug_rows.append({
-                        "epoch": epoch + 1,
-                        "target_pitch": int(y_pitch[sample_idx].item()),
-                        "pred_pitch": int(predicted_pitch[sample_idx].item()),
-                        "input_sequence": x_pitch[sample_idx].detach().cpu().tolist(),
-                        "topk_indices": topk_indices.detach().cpu().tolist(),
-                        "topk_probs": topk_probs.detach().cpu().tolist(),
-                    })
 
         metrics = torch.tensor(
             [
@@ -616,29 +512,13 @@ def main_worker(gpu, world_size, hparams):
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_topk_correct, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_confusion, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_pred_counts, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_target_counts, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_bucket_correct, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_bucket_total, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_interval_correct, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_interval_total, op=dist.ReduceOp.SUM)
 
         (
-            train_l,
-            train_p_l,
-            train_pc_l,
-            train_oct_l,
-            val_l,
-            val_p_l,
-            val_pc_l,
-            val_oct_l,
-            train_correct_all,
-            train_total_all,
-            val_correct_all,
-            val_total_all,
-            val_pc_correct_all,
-            val_oct_correct_all,
-            val_pure_octave_errors_all
+            train_l, train_p_l, train_pc_l, train_oct_l,
+            val_l, val_p_l, val_pc_l, val_oct_l,
+            train_correct_all, train_total_all,
+            val_correct_all, val_total_all,
+            val_pc_correct_all, val_oct_correct_all, val_pure_octave_errors_all
         ) = metrics.tolist()
 
         train_l /= world_size
@@ -663,92 +543,16 @@ def main_worker(gpu, world_size, hparams):
         scheduler.step()
 
         if is_main_process:
-            history_rows.append(
-                {
-                    "epoch": epoch + 1,
-                    "lr": current_lr,
-                    "train_loss": train_l,
-                    "train_pitch_loss": train_p_l,
-                    "train_pc_loss": train_pc_l,
-                    "train_oct_loss": train_oct_l,
-                    "train_acc": train_acc,
-                    "val_loss": val_l,
-                    "val_pitch_loss": val_p_l,
-                    "val_pc_loss": val_pc_l,
-                    "val_oct_loss": val_oct_l,
-                    "val_acc": val_acc,
-                    "val_acc_top3": val_acc_top3,
-                    "val_acc_top5": val_acc_top5,
-                    "val_pc_acc": val_pc_acc,
-                    "val_oct_acc": val_oct_acc,
-                    "val_pure_octave_err_rate": val_pure_oct_err_rate
-                }
-            )
-
-            # --- W&B Logging ---
-            log_payload = {
+            wandb.log({
                 "epoch": epoch + 1,
                 "learning_rate": current_lr,
                 "train/loss": train_l,
-                "train/pitch_loss": train_p_l,
-                "train/pc_loss": train_pc_l,
-                "train/oct_loss": train_oct_l,
                 "train/accuracy": train_acc,
                 "val/loss": val_l,
-                "val/pitch_loss": val_p_l,
-                "val/pc_loss": val_pc_l,
-                "val/oct_loss": val_oct_l,
                 "val/accuracy": val_acc,
                 "val/accuracy_top3": val_acc_top3,
                 "val/accuracy_top5": val_acc_top5,
-                "val/pitch_class_accuracy": val_pc_acc,
-                "val/octave_accuracy": val_oct_acc,
-                "val/pure_octave_error_rate": val_pure_oct_err_rate,
-            }
-
-            if (epoch + 1) % 10 == 0:
-                weights = model.module.fusion_layer.weight.detach().cpu().numpy().flatten()
-                weights_history.append(weights)
-                sampled_epochs.append(epoch + 1)
-
-                fig, ax = plt.subplots(figsize=(10, 6))
-                sns.heatmap(
-                    np.array(weights_history).T,
-                    cmap="coolwarm",
-                    xticklabels=[f"Epoch {e}" for e in sampled_epochs],
-                    ax=ax
-                )
-                ax.set_title("Fusion Layer Weight Evolution Heatmap")
-                ax.set_xlabel("Epoch")
-                ax.set_ylabel("Weight Index")
-                plt.tight_layout()
-
-                log_payload["weights/heatmap"] = wandb.Image(fig)
-                plt.close(fig)
-
-                val_confusion_cpu = val_confusion.detach().cpu().numpy()
-                fig_conf, ax_conf = plt.subplots(figsize=(8, 7))
-                sns.heatmap(
-                    np.log1p(val_confusion_cpu),
-                    cmap="viridis",
-                    ax=ax_conf,
-                    cbar_kws={"label": "log(1 + count)"},
-                )
-                ax_conf.set_title(f"Val Pitch Confusion Matrix (Epoch {epoch + 1})")
-                ax_conf.set_xlabel("Predicted Pitch")
-                ax_conf.set_ylabel("Target Pitch")
-                plt.tight_layout()
-
-                log_payload["val/confusion_matrix"] = wandb.Image(fig_conf)
-                plt.close(fig_conf)
-
-            wandb.log(log_payload, step=epoch + 1)
-
-            if (epoch + 1) % 5 == 0 and debug_rows:
-                pd.DataFrame(debug_rows).to_csv(
-                    artifacts_root / f"predictions_epoch_{epoch+1}.csv",
-                    index=False,
-                )
+            }, step=epoch + 1)
 
             print(
                 f"Epoch [{epoch+1}/{hparams['epochs']}] | "
@@ -756,22 +560,6 @@ def main_worker(gpu, world_size, hparams):
                 f"Train Loss: {train_l:.4f} | Train Acc: {train_acc*100:.2f}% | "
                 f"Val Loss: {val_l:.4f} | Val Acc: {val_acc*100:.2f}% | "
                 f"Time: {time.time() - epoch_start:.1f}s"
-            )
-            print(
-                f"Val Decomposed Accuracy | "
-                f"Pitch Class Acc: {val_pc_acc*100:.2f}% | "
-                f"Octave Acc: {val_oct_acc*100:.2f}% | "
-                f"Pure Octave Error Rate (Right PC, Wrong Oct): {val_pure_oct_err_rate*100:.2f}%"
-            )
-            print(
-                f"Val Pitch Top-k Accuracy | "
-                f"Acc@1: {val_acc*100:.2f}% | "
-                f"Acc@3: {val_acc_top3*100:.2f}% | "
-                f"Acc@5: {val_acc_top5*100:.2f}%"
-            )
-            print(
-                "Val Most Common Pitch Confusions | "
-                + summarize_pitch_confusions(val_confusion.detach().cpu(), top_n=5)
             )
 
             if val_p_l < best_val_pitch_loss:
@@ -781,66 +569,12 @@ def main_worker(gpu, world_size, hparams):
             else:
                 epochs_without_improvement += 1
 
-            # pd.DataFrame(history_rows).to_csv(history_csv_path, index=False)
-
-        stop_signal = torch.tensor(
-            [1 if epochs_without_improvement >= hparams["patience"] else 0],
-            device=gpu,
-        )
+        stop_signal = torch.tensor([1 if epochs_without_improvement >= hparams["patience"] else 0], device=gpu)
         dist.all_reduce(stop_signal, op=dist.ReduceOp.SUM)
         if stop_signal.item() > 0:
             break
 
-    # --- Test Evaluation ---
     if is_main_process:
-        print("\n--- Running Evaluation On Test Set ---")
-        checkpoint = torch.load(best_checkpoint_path, map_location='cuda:0')
-        model.module.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-
-        correct_pitch, total_samples = 0, 0
-        test_debug_rows = []
-
-        with torch.no_grad():
-            for x_pitch, y_pitch in test_loader:
-                x_pitch = x_pitch.cuda(0, non_blocking=True)
-                y_pitch = y_pitch.cuda(0, non_blocking=True)
-                
-                with autocast('cuda'):
-                    preds = model.module(x_pitch)
-                    predicted_classes = torch.argmax(preds['pitch'], dim=1)
-                    correct_pitch += (predicted_classes == y_pitch).sum().item()
-                    total_samples += y_pitch.size(0)
-
-                if len(test_debug_rows) < 5:
-                    samples_to_add = min(5 - len(test_debug_rows), y_pitch.size(0))
-                    for sample_idx in range(samples_to_add):
-                        probs = torch.softmax(preds['pitch'][sample_idx], dim=0)
-                        topk_probs, topk_indices = torch.topk(probs, k=3)
-                        test_debug_rows.append({
-                            "input_sequence": x_pitch[sample_idx].detach().cpu().tolist(),
-                            "pred_pitch": int(predicted_classes[sample_idx].item()),
-                            "target_pitch": int(y_pitch[sample_idx].item()),
-                            "topk_indices": topk_indices.detach().cpu().tolist(),
-                            "topk_probs": topk_probs.detach().cpu().tolist(),
-                        })
-
-        if total_samples > 0:
-            print(f"Final Pitch Accuracy: {(correct_pitch / total_samples) * 100:.2f}%")
-            for row in test_debug_rows:
-                print(
-                    format_pitch_prediction_row(
-                        split_name="Test",
-                        epoch_num="final",
-                        input_sequence=row["input_sequence"],
-                        pred_pitch=row["pred_pitch"],
-                        target_pitch=row["target_pitch"],
-                        topk_indices=row["topk_indices"],
-                        topk_probs=row["topk_probs"],
-                    )
-                )
-            wandb.log({"test/pitch_accuracy": correct_pitch / total_samples})
-
         wandb.finish()
 
     dist.destroy_process_group()
@@ -848,21 +582,21 @@ def main_worker(gpu, world_size, hparams):
 
 if __name__ == '__main__':
     hyperparameters = {
-            'seq_len': 128,
-            'hidden_size': 512,
-            'num_layers': 3,
-            'batch_size_per_gpu': 1024, # Increased from 256 for heavy GPU saturation
-            'epochs': 40,
-            'patience': 8,
-            'lr': 2.5e-3,               # Scaled up for the larger batch size
-            'warmup_epochs': 3,         # Slightly increased to stabilize the higher LR
-            'weight_decay': 1e-4,
-            'lambda_pc': 0.1,       
-            'lambda_oct': 0.3,      
-            'label_smoothing': 0.0,
-            'seed': 53,
-            'years_to_use': None
-        }
+        'seq_len': 128,
+        'hidden_size': 512,
+        'num_layers': 3,
+        'batch_size_per_gpu': 128,  # Adjusted to accommodate 128 target predictions per batch item
+        'epochs': 40,
+        'patience': 8,
+        'lr': 5e-4,               
+        'warmup_epochs': 5,         
+        'weight_decay': 1e-4,
+        'lambda_pc': 0.1,       
+        'lambda_oct': 0.3,      
+        'label_smoothing': 0.0,
+        'seed': 53,
+        'years_to_use': None
+    }
 
     gpus_available = torch.cuda.device_count()
     os.environ['MASTER_ADDR'] = 'localhost'
