@@ -210,7 +210,7 @@ def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
 
 class OptimizedMusicTransformer(nn.Module):
     """Predicts next REMI tokens in sequence using causal self-attention."""
-    def __init__(self, num_tokens=384, hidden_size=768, num_layers=6, num_heads=8, seq_len=768, dropout_rate=0.1):
+    def __init__(self, num_tokens=384, hidden_size=768, num_layers=6, num_heads=8, seq_len=768, dropout_rate=0.15):
         super().__init__()
         self.num_tokens = num_tokens
         
@@ -287,9 +287,9 @@ def main_worker(gpu, world_size, hparams):
     converted_notes = load_or_create_note_cache(dataset_root, is_main_process, hparams['years_to_use'])
     train_notes, val_notes, test_notes = split_song_arrays(converted_notes, seed=hparams['seed'])
 
-    train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], augment=True, hop_length=hparams['seq_len'])
-    val_dataset = BasicRNNForMusic(val_notes, seq_len=hparams['seq_len'], augment=False, hop_length=hparams['seq_len'])
-    test_dataset = BasicRNNForMusic(test_notes, seq_len=hparams['seq_len'], augment=False, hop_length=hparams['seq_len'])
+    train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], augment=True, hop_length=256)
+    val_dataset = BasicRNNForMusic(val_notes, seq_len=hparams['seq_len'], augment=False, hop_length=256)
+    test_dataset = BasicRNNForMusic(test_notes, seq_len=hparams['seq_len'], augment=False, hop_length=256)
 
     if is_main_process:
         print(f"Dataset split — Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
@@ -351,13 +351,8 @@ def main_worker(gpu, world_size, hparams):
                 flat_pitch_logits = preds['pitch'].reshape(-1, 384)
 
                 predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
-                if model.training:
-                    train_correct_t += (predicted_pitch == flat_y).sum()
-                    train_total += flat_y.size(0)
-                else:
-                    val_correct += (predicted_pitch == flat_y).sum().item()
-                    val_total += flat_y.size(0)
-
+                train_correct_t += (predicted_pitch == flat_y).sum()
+                train_total += flat_y.size(0)
                 loss_pitch = criterion_pitch(flat_pitch_logits, flat_y)
                 
                 train_loss = loss_pitch
@@ -530,12 +525,10 @@ if __name__ == '__main__':
             'batch_size_per_gpu': 32,   # Halved to prevent Out-Of-Memory errors with the larger hidden_size
             'epochs': 120,              # Increased to let the model train until early stopping kicks in
             'patience': 10,
-            'lr': 3e-4,                            
+            'lr': 2e-4,                            
             'warmup_epochs': 5,         
-            'weight_decay': 1e-4,
-            'lambda_pc': 0.0,           # Set to 0 to disable auxiliary loss and focus fully on pitch   
-            'lambda_oct': 0.0,          # Set to 0 to disable auxiliary loss and focus fully on pitch 
-            'label_smoothing': 0.0,
+            'weight_decay': 0.01,
+            'label_smoothing': 0.05,
             'seed': 53,
             'years_to_use': None
         }
