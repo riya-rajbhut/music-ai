@@ -104,15 +104,17 @@ def convert_all_songs_to_notes(dataset_root: pathlib.Path, years_to_use=None) ->
 
     all_songs = []
     for midi_file in all_midi_files:
-        notes_df = convert_midi_to_notes_remi(midi_file)
-        if not notes_df.empty:
-            all_songs.append(notes_df[['pitch']].to_numpy(dtype=np.float32))
+        tokens_array = convert_midi_to_notes_remi(midi_file)
+        # Check if the numpy array is not empty
+        if tokens_array.size > 0:
+            all_songs.append(tokens_array)
 
     return all_songs
 
 
 def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool, years_to_use=None) -> list:
-    cache_version = "v5_causal_seq2seq" 
+    # Bumped version tag to "v6_remi_tokens" to invalidate any old/corrupted pkl cache
+    cache_version = "v6_remi_tokens" 
     year_tag = "all" if years_to_use is None else "_".join(map(str, years_to_use))
     cache_file = dataset_root / f'converted_notes_{cache_version}_{year_tag}.pkl'
 
@@ -140,7 +142,6 @@ def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool,
                     return pickle.load(f)
             except (EOFError, pickle.UnpicklingError):
                 time.sleep(1)
-
 
 # ==========================================
 # 2. PYTORCH DATASET & SPLITTING
