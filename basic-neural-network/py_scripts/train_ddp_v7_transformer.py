@@ -534,9 +534,6 @@ def main_worker(gpu, world_size, hparams):
         val_acc_top3 = val_topk_correct[1].item() / val_total_all if val_total_all else 0.0
         val_acc_top5 = val_topk_correct[2].item() / val_total_all if val_total_all else 0.0
         
-        val_pc_acc = val_pc_correct_all / val_total_all if val_total_all else 0.0
-        val_oct_acc = val_oct_correct_all / val_total_all if val_total_all else 0.0
-        val_pure_oct_err_rate = val_pure_octave_errors_all / val_total_all if val_total_all else 0.0
 
         current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step()
@@ -573,6 +570,49 @@ def main_worker(gpu, world_size, hparams):
         if stop_signal.item() > 0:
             break
 
+# ==========================================
+    # 5. TEST EVALUATION (POST-TRAINING)
+    # ==========================================
+    
+    # Ensure all GPUs wait for training to completely finish
+    dist.barrier()
+    
+    # Load the best weights saved during the validation loop
+    # map_location ensures the weights are loaded safely across the correct GPUs
+    best_ckpt = torch.load(best_checkpoint_path, map_location=f'cuda:{gpu}', weights_only=True)
+    model.module.load_state_dict(best_ckpt["model_state_dict"])
+    
+    if is_main_process:
+        print("\n=== Commencing Test Evaluation using Best Checkpoint ===")
+        
+    model.eval()
+    test_correct = torch.zeros((), device=gpu, dtype=torch.float64)
+    test_total = 0
+
+    with torch.no_grad():
+        for x_pitch, y_pitch in test_loader:
+            x_pitch = x_pitch.cuda(gpu, non_blocking=True)
+            y_pitch = y_pitch.cuda(gpu, non_blocking=True)
+
+            with autocast("cuda"):
+                preds = model(x_pitch)
+                
+                flat_y = y_pitch.reshape(-1)
+                flat_pitch_logits = preds['pitch'].reshape(-1, 128)
+                
+                predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
+                test_correct += (predicted_pitch == flat_y).sum()
+                test_total += flat_y.size(0)
+
+    # Aggregate test results across all GPUs
+    dist.all_reduce(test_correct, op=dist.ReduceOp.SUM)
+    
+    test_accuracy = (test_correct.item() / (test_total * world_size)) if test_total > 0 else 0.0
+
+    if is_main_process:
+        print(f"Final Test Accuracy: {test_accuracy * 100:.2f}%")
+        wandb.log({"test/accuracy": test_accuracy})
+
     if is_main_process:
         wandb.finish()
 
@@ -581,13 +621,13 @@ def main_worker(gpu, world_size, hparams):
 
 if __name__ == '__main__':
     hyperparameters = {
-        'seq_len': 128,
+        'seq_len': 256,             # Increased for more musical context
         'hidden_size': 512,
-        'num_layers': 3,
-        'batch_size_per_gpu': 128,  # Adjusted to accommodate 128 target predictions per batch item
-        'epochs': 40,
-        'patience': 8,
-        'lr': 5e-4,               
+        'num_layers': 6,            # Doubled to increase model capacity
+        'batch_size_per_gpu': 64,   # Halved to compensate for the larger seq_len
+        'epochs': 60,               # Deeper models may need a bit longer to train
+        'patience': 10,
+        'lr': 3e-4,                 # Slightly lowered for stability             
         'warmup_epochs': 5,         
         'weight_decay': 1e-4,
         'lambda_pc': 0.1,       
