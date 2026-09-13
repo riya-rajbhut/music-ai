@@ -621,22 +621,21 @@ def main_worker(gpu, world_size, hparams):
 
 if __name__ == '__main__':
     hyperparameters = {
-        'seq_len': 256,             # Increased for more musical context
-        'hidden_size': 512,
-        'num_layers': 6,            # Doubled to increase model capacity
-        'batch_size_per_gpu': 64,   # Halved to compensate for the larger seq_len
-        'epochs': 60,               # Deeper models may need a bit longer to train
-        'patience': 10,
-        'lr': 3e-4,                 # Slightly lowered for stability             
-        'warmup_epochs': 5,         
-        'weight_decay': 1e-4,
-        'lambda_pc': 0.1,       
-        'lambda_oct': 0.3,      
-        'label_smoothing': 0.0,
-        'seed': 53,
-        'years_to_use': None
-    }
-
+            'seq_len': 256,             
+            'hidden_size': 768,         # Widen the network (BERT-base size) to learn complex patterns
+            'num_layers': 6,            
+            'batch_size_per_gpu': 32,   # Halved to prevent Out-Of-Memory errors with the larger hidden_size
+            'epochs': 100,              # Increased to let the model train until early stopping kicks in
+            'patience': 10,
+            'lr': 3e-4,                            
+            'warmup_epochs': 5,         
+            'weight_decay': 1e-4,
+            'lambda_pc': 0.0,           # Set to 0 to disable auxiliary loss and focus fully on pitch   
+            'lambda_oct': 0.0,          # Set to 0 to disable auxiliary loss and focus fully on pitch 
+            'label_smoothing': 0.0,
+            'seed': 53,
+            'years_to_use': None
+        }
     gpus_available = torch.cuda.device_count()
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
