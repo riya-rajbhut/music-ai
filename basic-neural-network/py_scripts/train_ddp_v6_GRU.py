@@ -458,7 +458,7 @@ def main_worker(gpu, world_size, hparams):
         nonfinite_grad_batches = 0
         train_correct, train_total = 0, 0
 
-        for (inputs, targets) in enumerate(train_loader):
+        for inputs, targets in train_loader:
             x_pitch = inputs[0].cuda(gpu, non_blocking=True)
             x_time = inputs[1].cuda(gpu, non_blocking=True)
             y_pitch = targets[0].cuda(gpu, non_blocking=True)
