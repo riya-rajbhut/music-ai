@@ -61,7 +61,7 @@ def convert_midi_to_notes_remi(midi_file_path: str) -> np.ndarray:
     sorted_notes = sorted(instrument.notes, key=lambda note: (note.start, note.pitch))
     if not sorted_notes:
         return np.array([], dtype=np.int64)
-    print(f"sorted_notes: {sorted_notes[:32]}")  # Print the first 10 notes for debugging
+    #print(f"sorted_notes: {sorted_notes[:32]}")  # Print the first 10 notes for debugging
     tokens = []
     prev_start = sorted_notes[0].start
     
@@ -88,7 +88,7 @@ def convert_midi_to_notes_remi(midi_file_path: str) -> np.ndarray:
         
         prev_start = note.start
 
-    print(tokens[:32])
+    #print(tokens[:32])
     # Return a 1D array of integers, not a DataFrame
     return np.array(tokens, dtype=np.int64)
 
@@ -110,7 +110,10 @@ def convert_all_songs_to_notes(dataset_root: pathlib.Path, years_to_use=None) ->
         if tokens_array.size > 0:
             all_songs.append(tokens_array)
 
+    print(f"midi files found: {len(all_midi_files)}")
     print(f"Converted {len(all_songs)} songs to REMI token sequences.")
+    print(f"Sample token sequence (first 32 tokens) from the first song: {all_songs[0][:32]}")
+    print(f"Sample token sequence (last 32 tokens) from the last song: {all_songs[-1][-32:]}")
 
     return all_songs
 
