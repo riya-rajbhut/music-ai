@@ -88,6 +88,12 @@ def convert_midi_to_notes_remi(midi_file_path: str) -> np.ndarray:
         
         prev_start = note.start
 
+    print("PrettyMIDI preview (first 1000 chars):")
+    print(str(midi_data)[:1000])
+
+    print("\nToken preview (first 1000 entries):")
+    print(tokens[:1000])
+
     # Return a 1D array of integers, not a DataFrame
     return np.array(tokens, dtype=np.int64)
 
@@ -109,6 +115,7 @@ def convert_all_songs_to_notes(dataset_root: pathlib.Path, years_to_use=None) ->
         if tokens_array.size > 0:
             all_songs.append(tokens_array)
 
+    print(f"Converted {len(all_songs)} songs to REMI token sequences.")
     return all_songs
 
 
@@ -149,12 +156,13 @@ def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool,
 
 class BasicRNNForMusic(data.Dataset):
     """Causal sequence-to-sequence dataset for REMI tokens."""
-    def __init__(self, song_note_arrays, seq_len=768, augment=False, hop_length=None):
+    def __init__(self, song_note_arrays, seq_len, hop_length,augment):
         self.seq_len = seq_len
         self.augment = augment
-        self.hop_length = hop_length if hop_length is not None else seq_len
+        self.hop_length = hop_length
         self.song_pitches = []
         self.index_map = []
+        
         
         for song_notes in song_note_arrays:
             # song_notes is a 1D array of REMI tokens now
@@ -210,7 +218,7 @@ def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
 
 class OptimizedMusicTransformer(nn.Module):
     """Predicts next REMI tokens in sequence using causal self-attention."""
-    def __init__(self, num_tokens=384, hidden_size=768, num_layers=6, num_heads=8, seq_len=768, dropout_rate=0.15):
+    def __init__(self, num_tokens=384, hidden_size=768, num_layers=6, num_heads=8, seq_len=768, dropout_rate=0.1):
         super().__init__()
         self.num_tokens = num_tokens
         
@@ -269,15 +277,17 @@ def main_worker(gpu, world_size, hparams):
 
     if is_main_process:
         wandb_api_key = "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"
-        if wandb_api_key:
-            wandb.login(key=wandb_api_key)
-        else:
-            wandb.login()
+        wandb.login(key=wandb_api_key)
         wandb.init(
             project="music-rnn-ddp",
             entity="riya-rajbhut-student",
             config=hparams
         )
+        print("Hyperparameters:")
+        for key, value in hparams.items():
+            print(f"  {key}: {value}")
+
+        wandb.config.update(hparams)
 
     dataset_root = pathlib.Path('data/maestro-v3.0.0')
     if is_main_process:
@@ -287,9 +297,9 @@ def main_worker(gpu, world_size, hparams):
     converted_notes = load_or_create_note_cache(dataset_root, is_main_process, hparams['years_to_use'])
     train_notes, val_notes, test_notes = split_song_arrays(converted_notes, seed=hparams['seed'])
 
-    train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], augment=True, hop_length=256)
-    val_dataset = BasicRNNForMusic(val_notes, seq_len=hparams['seq_len'], augment=False, hop_length=256)
-    test_dataset = BasicRNNForMusic(test_notes, seq_len=hparams['seq_len'], augment=False, hop_length=256)
+    train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], hop_length=hparams['hop_length'],augment=hparams['train_augment'])
+    val_dataset = BasicRNNForMusic(val_notes, seq_len=hparams['seq_len'], hop_length=hparams['hop_length'], augment=hparams['val_augment'])
+    test_dataset = BasicRNNForMusic(test_notes, seq_len=hparams['seq_len'], hop_length=hparams['hop_length'], augment=hparams['test_augment'])
 
     if is_main_process:
         print(f"Dataset split — Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
@@ -323,6 +333,7 @@ def main_worker(gpu, world_size, hparams):
     best_checkpoint_path = artifacts_root / "best_model.pt"
     if is_main_process:
         artifacts_root.mkdir(parents=True, exist_ok=True)
+
 
     best_val_pitch_loss = float("inf")
     epochs_without_improvement = 0
@@ -525,12 +536,16 @@ if __name__ == '__main__':
             'batch_size_per_gpu': 32,   # Halved to prevent Out-Of-Memory errors with the larger hidden_size
             'epochs': 120,              # Increased to let the model train until early stopping kicks in
             'patience': 10,
-            'lr': 2e-4,                            
+            'lr': 3e-4,                            
             'warmup_epochs': 5,         
-            'weight_decay': 0.01,
-            'label_smoothing': 0.05,
+            'weight_decay': 1e-4,
+            'label_smoothing': 0.0,
             'seed': 53,
-            'years_to_use': None
+            'years_to_use': None,
+            'hop_length': 256,
+            'train_augment': False,
+            'val_augment': False,
+            'test_augment': False
         }
     gpus_available = torch.cuda.device_count()
     os.environ['MASTER_ADDR'] = 'localhost'
