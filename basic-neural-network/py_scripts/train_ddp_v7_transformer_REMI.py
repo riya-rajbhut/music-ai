@@ -61,7 +61,7 @@ def convert_midi_to_notes_remi(midi_file_path: str) -> np.ndarray:
     sorted_notes = sorted(instrument.notes, key=lambda note: (note.start, note.pitch))
     if not sorted_notes:
         return np.array([], dtype=np.int64)
-
+    print(f"sorted_notes: {sorted_notes[:32]}")  # Print the first 10 notes for debugging
     tokens = []
     prev_start = sorted_notes[0].start
     
@@ -88,12 +88,7 @@ def convert_midi_to_notes_remi(midi_file_path: str) -> np.ndarray:
         
         prev_start = note.start
 
-    print("PrettyMIDI preview (first 1000 chars):")
-    print(str(midi_data)[:1000])
-
-    print("\nToken preview (first 1000 entries):")
-    print(tokens[:1000])
-
+    print(tokens[:32])
     # Return a 1D array of integers, not a DataFrame
     return np.array(tokens, dtype=np.int64)
 
@@ -116,6 +111,7 @@ def convert_all_songs_to_notes(dataset_root: pathlib.Path, years_to_use=None) ->
             all_songs.append(tokens_array)
 
     print(f"Converted {len(all_songs)} songs to REMI token sequences.")
+
     return all_songs
 
 
@@ -534,8 +530,8 @@ if __name__ == '__main__':
             'hidden_size': 768,         # Widen the network (BERT-base size) to learn complex patterns
             'num_layers': 6,            
             'batch_size_per_gpu': 32,   # Halved to prevent Out-Of-Memory errors with the larger hidden_size
-            'epochs': 120,              # Increased to let the model train until early stopping kicks in
-            'patience': 10,
+            'epochs': 60,             
+            'patience': 8,
             'lr': 3e-4,                            
             'warmup_epochs': 5,         
             'weight_decay': 1e-4,
