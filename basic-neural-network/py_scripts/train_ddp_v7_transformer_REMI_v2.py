@@ -301,6 +301,10 @@ def main_worker(gpu, world_size, hparams):
     is_main_process = (rank == 0)
 
     if is_main_process:
+        wandb_api_key = "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"
+        wandb.login(key=wandb_api_key)
+
+
         wandb.init(
             project="music-rnn-ddp",
             entity="riya-rajbhut-student",
@@ -522,7 +526,7 @@ if __name__ == '__main__':
         'hidden_size': 768,         
         'num_layers': 6,            
         'batch_size_per_gpu': 32,   
-        'epochs': 120,              
+        'epochs': 40,              
         'patience': 20,              # Extended patience so cosine scheduler decays to 1e-5
         'lr': 2.5e-4,                            
         'warmup_epochs': 5,         
