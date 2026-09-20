@@ -522,7 +522,7 @@ if __name__ == '__main__':
         'hidden_size': 768,         
         'num_layers': 6,            
         'batch_size_per_gpu': 32,   
-        'epochs': 120,              
+        'epochs': 60,              
         'patience': 20,              # Extended patience so cosine scheduler decays to 1e-5
         'lr': 2.5e-4,                            
         'warmup_epochs': 5,         
