@@ -301,6 +301,9 @@ def main_worker(gpu, world_size, hparams):
     is_main_process = (rank == 0)
 
     if is_main_process:
+        wandb_api_key = "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"
+        wandb.login(key=wandb_api_key)
+
         wandb.init(
             project="music-rnn-ddp",
             entity="riya-rajbhut-student",
