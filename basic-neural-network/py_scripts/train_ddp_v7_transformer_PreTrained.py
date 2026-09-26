@@ -1,4 +1,6 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import pathlib
 import pickle
 import time
@@ -190,31 +192,28 @@ def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
 # ==========================================
 
 class PretrainedMusicTransformer(nn.Module):
-    """
-    Wraps a Pretrained Hugging Face GPT-2 backbone and adapts token embeddings 
-    and output head to match custom REMI vocabulary size (384 tokens).
-    """
     def __init__(self, pretrained_model_name="gpt2", num_tokens=384, seq_len=768, dropout_rate=0.15):
         super().__init__()
         
         # Load Pretrained Backbone
         self.transformer = GPT2LMHeadModel.from_pretrained(pretrained_model_name)
         
-        # Adjust Token Embeddings for REMI Token Set Size (384)
+        # Adjust Token Embeddings
         self.transformer.resize_token_embeddings(num_tokens)
         
-        # Update Configuration Dropout & Sequence Settings
+        # Enable Gradient Checkpointing to Save VRAM
+        self.transformer.gradient_checkpointing_enable()
+        
+        # Update Configuration
         self.transformer.config.resid_pdrop = dropout_rate
         self.transformer.config.embd_pdrop = dropout_rate
         self.transformer.config.attn_pdrop = dropout_rate
         self.transformer.config.n_positions = seq_len
 
     def forward(self, token_seq):
-        # Hugging Face GPT2LMHeadModel produces Causal Attention internally
         outputs = self.transformer(input_ids=token_seq)
-        logits = outputs.logits  # Shape: (batch_size, seq_len, num_tokens)
-        return {'pitch': logits}
-
+        return {'pitch': outputs.logits}
+    
 # ==========================================
 # 4. MAIN WORKER & TRAINING LOOP
 # ==========================================
@@ -295,11 +294,13 @@ def main_worker(gpu, world_size, hparams):
         train_correct_t = torch.zeros((), device=gpu, dtype=torch.float64)
         train_total = 0
 
+        grad_accum_steps = hparams.get('grad_accum_steps', 1)
+
+        optimizer.zero_grad(set_to_none=True)
+
         for batch_idx, (x_pitch, y_pitch) in enumerate(train_loader):
             x_pitch = x_pitch.cuda(gpu, non_blocking=True)
             y_pitch = y_pitch.cuda(gpu, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
 
             with autocast("cuda"):
                 preds = model(x_pitch)
@@ -309,17 +310,22 @@ def main_worker(gpu, world_size, hparams):
                 predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
                 train_correct_t += (predicted_pitch == flat_y).sum()
                 train_total += flat_y.size(0)
-                loss_pitch = criterion_pitch(flat_pitch_logits, flat_y)
+                
+                # Scale loss by accumulation steps
+                loss_pitch = criterion_pitch(flat_pitch_logits, flat_y) / grad_accum_steps
 
             scaler.scale(loss_pitch).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-            scaler.step(optimizer)
-            scaler.update()
 
-            running_loss_t += loss_pitch.detach()
-            running_pitch_loss_t += loss_pitch.detach()
+            # Step optimizer only after accumulated steps
+            if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(train_loader):
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
+            running_loss_t += (loss_pitch.detach() * grad_accum_steps)
+            running_pitch_loss_t += (loss_pitch.detach() * grad_accum_steps)
         running_loss = running_loss_t.item()
         running_pitch_loss = running_pitch_loss_t.item()
         train_correct = train_correct_t.item()
@@ -448,12 +454,13 @@ def main_worker(gpu, world_size, hparams):
 
 if __name__ == '__main__':
     hyperparameters = {
-        'pretrained_model_name': 'gpt2', # Pretrained Hugging Face GPT-2 base architecture
+        'pretrained_model_name': 'gpt2',
         'seq_len': 768,             
-        'batch_size_per_gpu': 32,   
+        'batch_size_per_gpu': 8,              # Reduced from 32 -> 8 to prevent OOM
+        'grad_accum_steps': 4,                # 8 * 4 = 32 effective batch size per GPU
         'epochs': 40,              
         'patience': 10,              
-        'lr': 5e-5,                  # Fine-tuning requires lower learning rate (e.g., 5e-5 vs 3e-4)          
+        'lr': 5e-5,                  
         'warmup_epochs': 2,         
         'weight_decay': 0.01,        
         'label_smoothing': 0.05,     
