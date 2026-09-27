@@ -6,6 +6,7 @@ import pickle
 import time
 import random
 import warnings
+from contextlib import nullcontext
 
 warnings.filterwarnings('ignore', message='pkg_resources is deprecated as an API')
 
@@ -38,7 +39,7 @@ def download_maestro_dataset(dest_dir: str = 'data') -> pathlib.Path:
     extracted_folder = base_path / 'maestro-v3.0.0'
 
     if not (zip_target.exists() and extracted_folder.exists()):
-        print("Downloading dataset...")
+        print("Downloading dataset...", flush=True)
         download_url_to_file(url, str(zip_target), progress=True)
         import zipfile
         with zipfile.ZipFile(zip_target, 'r') as zip_ref:
@@ -132,7 +133,7 @@ def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool,
 # 2. PYTORCH DATASET & SPLITTING
 # ==========================================
 
-class BasicRNNForMusic(data.Dataset):
+class RemiTokenDataset(data.Dataset):
     """Causal sequence-to-sequence dataset for REMI tokens with pitch shift augmentation."""
     def __init__(self, song_note_arrays, seq_len, hop_length, augment):
         self.seq_len = seq_len
@@ -192,17 +193,30 @@ def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
 # ==========================================
 
 class PretrainedMusicTransformer(nn.Module):
-    def __init__(self, pretrained_model_name="gpt2", num_tokens=384, seq_len=768, dropout_rate=0.15):
+    def __init__(self, pretrained_model_name="gpt2", num_tokens=384, seq_len=768, dropout_rate=0.15,
+                 use_gradient_checkpointing=False):
         super().__init__()
         
-        # Load Pretrained Backbone
-        self.transformer = GPT2LMHeadModel.from_pretrained(pretrained_model_name)
+        # Load Pretrained Backbone. attn_implementation="sdpa" requests PyTorch's fused
+        # scaled-dot-product-attention kernel explicitly (it's already the default on
+        # torch>=2.1.1 when available, but pinning it avoids silently falling back to
+        # the slower eager implementation on an older torch build).
+        self.transformer = GPT2LMHeadModel.from_pretrained(pretrained_model_name, attn_implementation="sdpa")
         
         # Adjust Token Embeddings
         self.transformer.resize_token_embeddings(num_tokens)
         
-        # Enable Gradient Checkpointing to Save VRAM
-        self.transformer.gradient_checkpointing_enable()
+        # Gradient checkpointing trades compute for VRAM (it re-runs the forward pass
+        # during backward instead of storing activations) - it's meant for pushing large
+        # batches into limited memory. At small batch sizes it mostly just adds recompute
+        # overhead for no benefit, so it's off by default here. Re-enable it only if you
+        # raise batch_size_per_gpu enough to hit OOM again.
+        if use_gradient_checkpointing:
+            self.transformer.gradient_checkpointing_enable()
+        else:
+            # use_cache defaults to True and is incompatible with gradient checkpointing;
+            # setting it explicitly avoids the per-epoch "Setting use_cache=False" warning.
+            self.transformer.config.use_cache = False
         
         # Update Configuration
         self.transformer.config.resid_pdrop = dropout_rate
@@ -243,12 +257,12 @@ def main_worker(gpu, world_size, hparams):
     converted_notes = load_or_create_note_cache(dataset_root, is_main_process, hparams['years_to_use'])
     train_notes, val_notes, test_notes = split_song_arrays(converted_notes, seed=hparams['seed'])
 
-    train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], hop_length=hparams['hop_length'], augment=hparams['train_augment'])
-    val_dataset = BasicRNNForMusic(val_notes, seq_len=hparams['seq_len'], hop_length=hparams['hop_length'], augment=hparams['val_augment'])
-    test_dataset = BasicRNNForMusic(test_notes, seq_len=hparams['seq_len'], hop_length=hparams['hop_length'], augment=hparams['test_augment'])
+    train_dataset = RemiTokenDataset(train_notes, seq_len=hparams['seq_len'], hop_length=hparams['hop_length'], augment=hparams['train_augment'])
+    val_dataset = RemiTokenDataset(val_notes, seq_len=hparams['seq_len'], hop_length=hparams['hop_length'], augment=hparams['val_augment'])
+    test_dataset = RemiTokenDataset(test_notes, seq_len=hparams['seq_len'], hop_length=hparams['hop_length'], augment=hparams['test_augment'])
 
     if is_main_process:
-        print(f"Dataset split — Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+        print(f"Dataset split — Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}", flush=True)
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
@@ -262,7 +276,8 @@ def main_worker(gpu, world_size, hparams):
         pretrained_model_name=hparams['pretrained_model_name'],
         num_tokens=384,
         seq_len=hparams['seq_len'],
-        dropout_rate=hparams['dropout_rate']
+        dropout_rate=hparams['dropout_rate'],
+        use_gradient_checkpointing=hparams.get('use_gradient_checkpointing', False)
     ).cuda(gpu)
     model = DDP(model, device_ids=[gpu])
 
@@ -290,7 +305,6 @@ def main_worker(gpu, world_size, hparams):
         model.train()
 
         running_loss_t = torch.zeros((), device=gpu, dtype=torch.float64)
-        running_pitch_loss_t = torch.zeros((), device=gpu, dtype=torch.float64)
         train_correct_t = torch.zeros((), device=gpu, dtype=torch.float64)
         train_total = 0
 
@@ -302,22 +316,29 @@ def main_worker(gpu, world_size, hparams):
             x_pitch = x_pitch.cuda(gpu, non_blocking=True)
             y_pitch = y_pitch.cuda(gpu, non_blocking=True)
 
-            with autocast("cuda"):
-                preds = model(x_pitch)
-                flat_y = y_pitch.reshape(-1)
-                flat_pitch_logits = preds['pitch'].reshape(-1, 384)
+            is_last_micro_batch = (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(train_loader)
+            # DDP all-reduces gradients on every .backward() by default. During the
+            # accumulation micro-batches that aren't the last one, no_sync() skips that
+            # all-reduce - it only needs to happen once, right before optimizer.step().
+            sync_context = nullcontext() if is_last_micro_batch else model.no_sync()
 
-                predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
-                train_correct_t += (predicted_pitch == flat_y).sum()
-                train_total += flat_y.size(0)
-                
-                # Scale loss by accumulation steps
-                loss_pitch = criterion_pitch(flat_pitch_logits, flat_y) / grad_accum_steps
+            with sync_context:
+                with autocast("cuda"):
+                    preds = model(x_pitch)
+                    flat_y = y_pitch.reshape(-1)
+                    flat_pitch_logits = preds['pitch'].reshape(-1, 384)
 
-            scaler.scale(loss_pitch).backward()
+                    predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
+                    train_correct_t += (predicted_pitch == flat_y).sum()
+                    train_total += flat_y.size(0)
+                    
+                    # Scale loss by accumulation steps
+                    loss_pitch = criterion_pitch(flat_pitch_logits, flat_y) / grad_accum_steps
 
-            # Step optimizer only after accumulated steps
-            if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(train_loader):
+                scaler.scale(loss_pitch).backward()
+
+            # Step optimizer only after accumulated steps (gradients are already synced above)
+            if is_last_micro_batch:
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                 scaler.step(optimizer)
@@ -325,14 +346,20 @@ def main_worker(gpu, world_size, hparams):
                 optimizer.zero_grad(set_to_none=True)
 
             running_loss_t += (loss_pitch.detach() * grad_accum_steps)
-            running_pitch_loss_t += (loss_pitch.detach() * grad_accum_steps)
+
+            if is_main_process and (batch_idx + 1) % 200 == 0:
+                print(
+                    f"Epoch [{epoch+1}/{hparams['epochs']}] | "
+                    f"Batch [{batch_idx+1}/{len(train_loader)}] | "
+                    f"Loss: {loss_pitch.item() * grad_accum_steps:.4f}",
+                    flush=True
+                )
         running_loss = running_loss_t.item()
-        running_pitch_loss = running_pitch_loss_t.item()
         train_correct = train_correct_t.item()
 
         # Validation Loop
         model.eval()
-        val_loss_tot, val_loss_p = 0.0, 0.0
+        val_loss_tot = 0.0
         val_correct, val_total = 0, 0
         
         with torch.no_grad():
@@ -351,14 +378,11 @@ def main_worker(gpu, world_size, hparams):
                     
                     loss_pitch = criterion_pitch(flat_pitch_logits, flat_y)
                     val_loss_tot += loss_pitch.item()
-                    val_loss_p += loss_pitch.item()
 
         metrics = torch.tensor(
             [
                 running_loss / len(train_loader),
-                running_pitch_loss / len(train_loader),
                 val_loss_tot / len(val_loader),
-                val_loss_p / len(val_loader),
                 train_correct,
                 train_total,
                 val_correct,
@@ -370,16 +394,14 @@ def main_worker(gpu, world_size, hparams):
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
         
         (
-            train_l, train_p_l, 
-            val_l, val_p_l, 
+            train_l,
+            val_l,
             train_correct_all, train_total_all,
             val_correct_all, val_total_all
         ) = metrics.tolist()
 
         train_l /= world_size
-        train_p_l /= world_size
         val_l /= world_size
-        val_p_l /= world_size
 
         train_acc = train_correct_all / train_total_all if train_total_all else 0.0
         val_acc = val_correct_all / val_total_all if val_total_all else 0.0
@@ -402,11 +424,12 @@ def main_worker(gpu, world_size, hparams):
                 f"LR: {current_lr:.6f} | "
                 f"Train Loss: {train_l:.4f} | Train Acc: {train_acc*100:.2f}% | "
                 f"Val Loss: {val_l:.4f} | Val Acc: {val_acc*100:.2f}% | "
-                f"Time: {time.time() - epoch_start:.1f}s"
+                f"Time: {time.time() - epoch_start:.1f}s",
+                flush=True
             )
 
-            if val_p_l < best_val_pitch_loss:
-                best_val_pitch_loss = val_p_l
+            if val_l < best_val_pitch_loss:
+                best_val_pitch_loss = val_l
                 epochs_without_improvement = 0
                 torch.save({"model_state_dict": model.module.state_dict()}, best_checkpoint_path)
             else:
@@ -423,7 +446,7 @@ def main_worker(gpu, world_size, hparams):
     dist.barrier()
     
     if is_main_process:
-        print("\n=== Commencing Test Evaluation using Best Checkpoint ===")
+        print("\n=== Commencing Test Evaluation using Best Checkpoint ===", flush=True)
         best_ckpt = torch.load(best_checkpoint_path, map_location=f'cuda:{gpu}', weights_only=True)
         model.module.load_state_dict(best_ckpt["model_state_dict"])
         model.eval()
@@ -445,7 +468,7 @@ def main_worker(gpu, world_size, hparams):
                     test_total += flat_y.size(0)
 
         test_accuracy = (test_correct / test_total) if test_total > 0 else 0.0
-        print(f"Final Test Accuracy: {test_accuracy * 100:.2f}%")
+        print(f"Final Test Accuracy: {test_accuracy * 100:.2f}%", flush=True)
         wandb.log({"test/accuracy": test_accuracy})
         wandb.finish()
 
@@ -456,8 +479,13 @@ if __name__ == '__main__':
     hyperparameters = {
         'pretrained_model_name': 'gpt2',
         'seq_len': 768,             
-        'batch_size_per_gpu': 8,              # Reduced from 32 -> 8 to prevent OOM
-        'grad_accum_steps': 4,                # 8 * 4 = 32 effective batch size per GPU
+        'batch_size_per_gpu': 16,             # Raised from 8 now that checkpointing is off -
+                                               # 8 already fit comfortably, so 16 is a safe first
+                                               # step up. Watch nvidia-smi on the first epoch; if
+                                               # it fits with headroom, you can try pushing to 24.
+        'grad_accum_steps': 2,                # 16 * 2 = 32 effective batch size per GPU (unchanged)
+        'use_gradient_checkpointing': False,  # Off by default - see PretrainedMusicTransformer.
+                                               # Flip back to True only if a larger batch OOMs.
         'epochs': 40,              
         'patience': 10,              
         'lr': 5e-5,                  
@@ -467,7 +495,12 @@ if __name__ == '__main__':
         'dropout_rate': 0.1,        
         'seed': 53,
         'years_to_use': None,
-        'hop_length': 256,
+        'hop_length': 256,                    # Lower hop_length = more overlapping (redundant)
+                                               # windows per song = more steps/epoch. Raising this
+                                               # (e.g. 384-512) cuts epoch time but also cuts how
+                                               # many gradient updates you get per epoch - not
+                                               # accuracy-free, so change deliberately and watch
+                                               # the val loss curve if you do.
         'train_augment': True,       
         'val_augment': False,
         'test_augment': False
@@ -477,8 +510,8 @@ if __name__ == '__main__':
     os.environ['MASTER_PORT'] = '12355'
 
     if gpus_available > 1:
-        print(f"Running DDP across {gpus_available} GPUs.")
+        print(f"Running DDP across {gpus_available} GPUs.", flush=True)
         torch.multiprocessing.spawn(main_worker, args=(gpus_available, hyperparameters), nprocs=gpus_available, join=True)
     else:
-        print("Running single-process fallback.")
+        print("Running single-process fallback.", flush=True)
         main_worker(0, 1, hyperparameters)
