@@ -575,6 +575,14 @@ def main_worker(gpu, world_size, hparams):
                 best_val_pitch_loss = val_l
                 epochs_without_improvement = 0
                 torch.save({"model_state_dict": model.module.state_dict()}, best_checkpoint_path)
+                artifact = wandb.Artifact(
+                    name="rope_2d_music_transformer_best", 
+                    type="model",
+                    description=f"Best model saved at epoch {epoch + 1} with val_loss {val_l:.4f}"
+                )
+                artifact.add_file(str(best_checkpoint_path))
+                wandb.log_artifact(artifact)
+
             else:
                 epochs_without_improvement += 1
 
@@ -625,7 +633,7 @@ if __name__ == '__main__':
         'hidden_size': 768,         # Widen the network (BERT-base size) to learn complex patterns
         'num_layers': 6,            
         'batch_size_per_gpu': 32,   # Halved to prevent Out-Of-Memory errors with the larger hidden_size
-        'epochs': 60,             
+        'epochs': 40,             
         'patience': 8,
         'lr': 3e-4,                            
         'warmup_epochs': 5,         
@@ -638,7 +646,7 @@ if __name__ == '__main__':
         'val_augment': False,
         'test_augment': False,
         'grad_accum_steps': 1,                # Lowered to 1 since batch size is increased.
-        'dropout_rate': 0.0,        
+        'dropout_rate': 0.1,        
         'embed_dim': 768,                     # Base GPT-2 Architecture Sizing
         'num_heads': 8,
     }

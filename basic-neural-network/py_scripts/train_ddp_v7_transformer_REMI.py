@@ -217,7 +217,7 @@ def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
 
 class OptimizedMusicTransformer(nn.Module):
     """Predicts next REMI tokens in sequence using causal self-attention."""
-    def __init__(self, num_tokens=384, hidden_size=768, num_layers=6, num_heads=8, seq_len=768, dropout_rate=0.1):
+    def __init__(self, num_tokens, hidden_size, num_layers, num_heads, seq_len, dropout_rate):
         super().__init__()
         self.num_tokens = num_tokens
         
@@ -470,6 +470,14 @@ def main_worker(gpu, world_size, hparams):
                 best_val_pitch_loss = val_p_l
                 epochs_without_improvement = 0
                 torch.save({"model_state_dict": model.module.state_dict()}, best_checkpoint_path)
+                artifact = wandb.Artifact(
+                    name="rei_music_transformer_best", 
+                    type="model",
+                    description=f"Best model saved at epoch {epoch + 1} with val_loss {val_l:.4f}"
+                )
+                artifact.add_file(str(best_checkpoint_path))
+                wandb.log_artifact(artifact)
+
             else:
                 epochs_without_improvement += 1
 
@@ -533,7 +541,7 @@ if __name__ == '__main__':
             'hidden_size': 768,         # Widen the network (BERT-base size) to learn complex patterns
             'num_layers': 6,            
             'batch_size_per_gpu': 32,   # Halved to prevent Out-Of-Memory errors with the larger hidden_size
-            'epochs': 60,             
+            'epochs': 40,             
             'patience': 8,
             'lr': 3e-4,                            
             'warmup_epochs': 5,         
@@ -544,8 +552,11 @@ if __name__ == '__main__':
             'hop_length': 256,
             'train_augment': False,
             'val_augment': False,
-            'test_augment': False
-        }
+            'test_augment': False,
+            'dropout_rate': 0.1,
+            'num_heads': 8,
+            'num_tokens': 384
+    }
     gpus_available = torch.cuda.device_count()
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
