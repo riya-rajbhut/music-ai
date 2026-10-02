@@ -493,24 +493,25 @@ def main_worker(gpu, world_size, hparams):
                     loss_pitch = criterion_pitch(flat_pitch_logits, flat_y)
                     val_loss_tot += loss_pitch.item()
 
-                    # NEW: Efficient Mistake Profiling
-                    if is_main_process: # Only profile on GPU 0 to avoid DDP sync overhead
-                        # Calculate per-token loss without reducing to a scalar
+# NEW: Efficient Mistake Profiling
+                    if is_main_process:
                         unreduced_loss = F.cross_entropy(flat_pitch_logits, flat_y, reduction='none')
-                        # Reshape to (Batch, Sequence) and average across the sequence length
-                        seq_losses = unreduced_loss.view(B, S).mean(dim=1)
+                        loss_per_seq = unreduced_loss.view(B, S)
                         
-                        # Find indices of sequences that exceed the threshold
-                        hard_idx = (seq_losses > MISTAKE_THRESHOLD).nonzero(as_tuple=True)[0]
+                        seq_mean_losses = loss_per_seq.mean(dim=1)
+                        seq_max_losses = loss_per_seq.max(dim=1).values
+                        
+                        # Log if the average sequence loss is > 2.2 
+                        # OR if a specific token in the sequence causes a massive spike (> 6.0)
+                        hard_idx = ((seq_mean_losses > 2.2) | (seq_max_losses > 6.0)).nonzero(as_tuple=True)[0]
                         
                         for idx in hard_idx:
-                            # Move immediately to CPU to keep VRAM free
                             hard_mistakes.append({
                                 'epoch': epoch + 1,
-                                'loss': seq_losses[idx].item(),
+                                'mean_loss': seq_mean_losses[idx].item(),
+                                'max_loss': seq_max_losses[idx].item(),
                                 'input_seq': x_pitch[idx].cpu().clone().numpy(),
                             })
-
         metrics = torch.tensor(
             [
                 running_loss / len(train_loader),
@@ -576,7 +577,7 @@ def main_worker(gpu, world_size, hparams):
                 torch.save({"model_state_dict": model.module.state_dict()}, best_checkpoint_path)
             else:
                 epochs_without_improvement += 1
-                
+
         stop_signal = torch.tensor([1 if epochs_without_improvement >= hparams["patience"] else 0], device=gpu)
         dist.all_reduce(stop_signal, op=dist.ReduceOp.SUM)
         if stop_signal.item() > 0:
@@ -621,24 +622,25 @@ def main_worker(gpu, world_size, hparams):
 if __name__ == '__main__':
     hyperparameters = {
         'seq_len': 768,             
-        'batch_size_per_gpu': 32,             # Increased from 16. Utilizes GPU fully and halves steps.
-        'grad_accum_steps': 1,                # Lowered to 1 since batch size is increased.
-        'epochs': 40,              
-        'patience': 10,              
-        'lr': 1e-4,                           # Boosted slightly for training a clean initialization from scratch
-        'warmup_epochs': 2,         
-        'weight_decay': 0.01,        
-        'label_smoothing': 0.05,     
-        'dropout_rate': 0.1,        
+        'hidden_size': 768,         # Widen the network (BERT-base size) to learn complex patterns
+        'num_layers': 6,            
+        'batch_size_per_gpu': 32,   # Halved to prevent Out-Of-Memory errors with the larger hidden_size
+        'epochs': 60,             
+        'patience': 8,
+        'lr': 3e-4,                            
+        'warmup_epochs': 5,         
+        'weight_decay': 1e-4,
+        'label_smoothing': 0.0,
         'seed': 53,
         'years_to_use': None,
-        'hop_length': 512,                    # Pushed from 256. Slashes dataset overlap, massively speeds up epochs.
-        'train_augment': True,       
+        'hop_length': 256,
+        'train_augment': False,
         'val_augment': False,
         'test_augment': False,
+        'grad_accum_steps': 1,                # Lowered to 1 since batch size is increased.
+        'dropout_rate': 0.0,        
         'embed_dim': 768,                     # Base GPT-2 Architecture Sizing
-        'num_heads': 12,
-        'num_layers': 12,
+        'num_heads': 8,
     }
     gpus_available = torch.cuda.device_count()
     os.environ['MASTER_ADDR'] = 'localhost'
