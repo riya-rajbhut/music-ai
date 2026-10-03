@@ -630,25 +630,25 @@ def main_worker(gpu, world_size, hparams):
 if __name__ == '__main__':
     hyperparameters = {
         'seq_len': 768,             
-        'hidden_size': 768,         # Widen the network (BERT-base size) to learn complex patterns
-        'num_layers': 6,            
-        'batch_size_per_gpu': 32,   # Halved to prevent Out-Of-Memory errors with the larger hidden_size
+        'hidden_size': 768,         
+        'num_layers': 12,            
+        'batch_size_per_gpu': 32,   
         'epochs': 40,             
         'patience': 8,
-        'lr': 3e-4,                            
-        'warmup_epochs': 5,         
-        'weight_decay': 1e-4,
-        'label_smoothing': 0.0,
+        'lr': 1e-4,                            
+        'warmup_epochs': 3,         
+        'weight_decay': 0.01,
+        'label_smoothing': 0.05,
         'seed': 53,
         'years_to_use': None,
-        'hop_length': 256,
-        'train_augment': False,
+        'hop_length': 384,
+        'train_augment': True,
         'val_augment': False,
         'test_augment': False,
-        'grad_accum_steps': 1,                # Lowered to 1 since batch size is increased.
+        'grad_accum_steps': 1,      
         'dropout_rate': 0.1,        
-        'embed_dim': 768,                     # Base GPT-2 Architecture Sizing
-        'num_heads': 8,
+        'embed_dim': 768,           
+        'num_heads': 12,
     }
     gpus_available = torch.cuda.device_count()
     os.environ['MASTER_ADDR'] = 'localhost'
