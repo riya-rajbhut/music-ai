@@ -312,10 +312,13 @@ def main_worker(gpu, world_size, hparams):
     test_loader = data.DataLoader(test_dataset, batch_size=hparams['batch_size_per_gpu'], pin_memory=True, num_workers=num_workers, shuffle=False)
 
     model = OptimizedMusicTransformer(
-        hidden_size=hparams['hidden_size'], 
+        num_tokens=hparams['num_tokens'],
+        hidden_size=hparams['hidden_size'],
         num_layers=hparams['num_layers'],
-        seq_len=hparams['seq_len']
-    ).cuda(gpu)
+        num_heads=hparams['num_heads'],
+        seq_len=hparams['seq_len'],
+        dropout_rate=hparams['dropout_rate']
+    ).cuda(gpu) 
     model = DDP(model, device_ids=[gpu])
 
     criterion_pitch = nn.CrossEntropyLoss(label_smoothing=hparams['label_smoothing'])
