@@ -562,6 +562,15 @@ def main_worker(gpu, world_size, hparams):
                 best_val_pitch_loss = val_p_l
                 epochs_without_improvement = 0
                 torch.save({"model_state_dict": model.module.state_dict()}, best_checkpoint_path)
+                
+                # --- WandB Model Artifact Logging Added Here ---
+                artifact = wandb.Artifact(
+                    name="best_model",
+                    type="model",
+                    description=f"Best model saved at epoch {epoch + 1} with val_loss {val_l:.4f}"
+                )
+                artifact.add_file(str(best_checkpoint_path))
+                wandb.log_artifact(artifact)
             else:
                 epochs_without_improvement += 1
 
