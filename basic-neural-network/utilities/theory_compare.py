@@ -66,13 +66,13 @@ SCRIPTS = {
     "v9": "train_ddp_v9_transformer_REMI_2drope_cpc_factored.py",
 }
 ARTIFACTS = {
-    "lstm": "riya-rajbhut-student/music-rnn-ddp/best_model:v19",  #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/bfv08du2/overview?nw=nwuserriyarajbhut
-    "gru": "riya-rajbhut-student/music-rnn-ddp/best_model:v159", #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/93zaxkty/overview?nw=nwuserriyarajbhut
-    "tf6": "riya-rajbhut-student/music-rnn-ddp/best_model:v67", #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/tokip0b4/overview?nw=nwuserriyarajbhut
-    "remi12": "riya-rajbhut-student/music-rnn-ddp/rei_music_transformer_best:v37", #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/pbsphwv8/overview?nw=nwuserriyarajbhut
-    "remi6": "riya-rajbhut-student/music-rnn-ddp/best_model:v166", #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/w3a86ses/overview?nw=nwuserriyarajbhut
-    "arcface": "riya-rajbhut-student/music-rnn-ddp/factorized_harmonic_transformer_best:v14", #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/vxtdzv99/overview?nw=nwuserriyarajbhut
-    "v9": "riya-rajbhut-student/music-rnn-ddp/rope_2d_music_transformer_best:v41", #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/vgopk612?nw=nwuserriyarajbhut
+    "lstm": "riya-rajbhut-student/music-rnn-ddp/best_model:v39",  #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/bfv08du2/overview?nw=nwuserriyarajbhut
+    "gru": "riya-rajbhut-student/music-rnn-ddp/best_model:v161", #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/93zaxkty/overview?nw=nwuserriyarajbhut
+    "tf6": "riya-rajbhut-student/music-rnn-ddp/best_model:v135", #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/tokip0b4/overview?nw=nwuserriyarajbhut
+    "remi12": "riya-rajbhut-student/music-rnn-ddp/rei_music_transformer_best:v57", #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/pbsphwv8/overview?nw=nwuserriyarajbhut
+    "remi6": "riya-rajbhut-student/music-rnn-ddp/best_model:v190", #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/w3a86ses/overview?nw=nwuserriyarajbhut
+    "arcface": "riya-rajbhut-student/music-rnn-ddp/factorized_harmonic_transformer_best:v14", #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/vgopk612?nw=nwuserriyarajbhut
+    "v9": "riya-rajbhut-student/music-rnn-ddp/rope_2d_music_transformer_best:v46", #https://forge.coreweave.com/wandb/riya-rajbhut-student/music-rnn-ddp/runs/vxtdzv99/overview?nw=nwuserriyarajbhut
 }
 LABELS = {
     "lstm": "LSTM {layers}L (pitch only)",
