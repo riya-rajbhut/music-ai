@@ -1,7 +1,12 @@
-# REMI - Revamped MIDI tokenization transformer with Rotary Positional Embeddings (RoPE)
+#REMI - Revamped MIDI its a music tokenizaton method that converts MIDI files into a 
+# sequence of tokens that represent musical events like pitch, time, and duration. 
+# It is designed to capture the structure and nuances of music, making it suitable for 
+# training machine learning models, especially in the context of music generation and analysis.
+
 import os
 import pathlib
 import pickle
+import collections
 import time
 import random
 import warnings
@@ -9,8 +14,11 @@ import warnings
 warnings.filterwarnings('ignore', message='pkg_resources is deprecated as an API')
 
 import numpy as np
+import pandas as pd
 import pretty_midi as pm
 import wandb
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 import torch
 import torch.nn as nn
@@ -56,22 +64,31 @@ def convert_midi_to_notes_remi(midi_file_path: str) -> np.ndarray:
 
     tokens = []
     prev_start = sorted_notes[0].start
+    
+    # Define our temporal resolution (e.g., 32 bins per second = ~31.25ms per tick)
     TICKS_PER_SECOND = 32 
 
     for note in sorted_notes:
+        # 1. Calculate time in seconds (your original logic)
         step_sec = note.start - prev_start
         duration_sec = note.end - note.start
         
+        # 2. Quantize seconds into discrete integer ticks
+        # Cap at 127 so we don't exceed our vocabulary limits
         step_ticks = min(int(step_sec * TICKS_PER_SECOND), 127) 
-        duration_ticks = min(max(int(duration_sec * TICKS_PER_SECOND), 1), 127)
+        duration_ticks = min(max(int(duration_sec * TICKS_PER_SECOND), 1), 127) # Ensure duration is at least 1
         
+        # 3. Shift integers into their designated vocabulary blocks
         time_shift_token = 128 + step_ticks
         pitch_token = note.pitch
         duration_token = 256 + duration_ticks
         
+        # 4. Append as a flat sequence: "Wait -> Play Note -> Hold Note"
         tokens.extend([time_shift_token, pitch_token, duration_token])
+        
         prev_start = note.start
 
+    # Return a 1D array of integers, not a DataFrame
     return np.array(tokens, dtype=np.int64)
 
 def convert_all_songs_to_notes(dataset_root: pathlib.Path, years_to_use=None) -> list:
@@ -88,6 +105,7 @@ def convert_all_songs_to_notes(dataset_root: pathlib.Path, years_to_use=None) ->
     all_songs = []
     for midi_file in all_midi_files:
         tokens_array = convert_midi_to_notes_remi(midi_file)
+        # Check if the numpy array is not empty
         if tokens_array.size > 0:
             all_songs.append(tokens_array)
 
@@ -95,6 +113,7 @@ def convert_all_songs_to_notes(dataset_root: pathlib.Path, years_to_use=None) ->
 
 
 def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool, years_to_use=None) -> list:
+    # Bumped version tag to "v6_remi_tokens" to invalidate any old/corrupted pkl cache
     cache_version = "v6_remi_tokens" 
     year_tag = "all" if years_to_use is None else "_".join(map(str, years_to_use))
     cache_file = dataset_root / f'converted_notes_{cache_version}_{year_tag}.pkl'
@@ -129,15 +148,16 @@ def load_or_create_note_cache(dataset_root: pathlib.Path, is_main_process: bool,
 # ==========================================
 
 class BasicRNNForMusic(data.Dataset):
-    """Causal sequence-to-sequence dataset for REMI tokens with interval-safe pitch shift."""
-    def __init__(self, song_note_arrays, seq_len, hop_length, augment):
+    """Causal sequence-to-sequence dataset for REMI tokens."""
+    def __init__(self, song_note_arrays, seq_len=768, augment=False, hop_length=None):
         self.seq_len = seq_len
         self.augment = augment
-        self.hop_length = hop_length
+        self.hop_length = hop_length if hop_length is not None else seq_len
         self.song_pitches = []
         self.index_map = []
         
         for song_notes in song_note_arrays:
+            # song_notes is a 1D array of REMI tokens now
             notes_array = np.asarray(song_notes, dtype=np.int64)
             if len(notes_array) <= self.seq_len:
                 continue
@@ -157,16 +177,15 @@ class BasicRNNForMusic(data.Dataset):
         song_idx, start_idx = self.index_map[idx]
         end_idx = start_idx + self.seq_len + 1
         
+        # Clone so we don't accidentally modify the original data in memory
         full_seq = self.song_pitches[song_idx][start_idx:end_idx].clone()
         
         if self.augment:
             shift = random.randint(-5, 5)
+            # Identify which tokens are pitch tokens (0-127)
             is_pitch = full_seq < 128
-            if is_pitch.any():
-                pitches = full_seq[is_pitch]
-                # Valid Transposition: Only apply shift if all pitches stay within standard MIDI bounds [0, 127]
-                if (pitches.min() + shift >= 0) and (pitches.max() + shift <= 127):
-                    full_seq[is_pitch] += shift
+            # Shift only the pitches, and clamp them to stay within 0-127 bounds
+            full_seq[is_pitch] = (full_seq[is_pitch] + shift).clamp_(0, 127)
 
         input_seq = full_seq[:-1]   # Shape: (seq_len,)
         target_seq = full_seq[1:]   # Shape: (seq_len,)
@@ -184,114 +203,62 @@ def split_song_arrays(song_note_arrays, seed, train_ratio=0.8, val_ratio=0.1):
         [song_note_arrays[i] for i in song_indices[val_cutoff:]]
     )
 
+
 # ==========================================
-# 3. ROTARY POSITIONAL EMBEDDING & TRANSFORMER
+# 3. MODEL ARCHITECTURE
 # ==========================================
-
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=2048):
-        super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
-
-    def forward(self, x, seq_len):
-        return self.cos_cached[:seq_len, :].to(x.dtype), self.sin_cached[:seq_len, :].to(x.dtype)
-
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-def apply_rotary_pos_emb(q, k, cos, sin):
-    cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim)
-    sin = sin.unsqueeze(0).unsqueeze(0)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-class CausalSelfAttentionWithRoPE(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout_rate=0.1):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        self.dropout_rate = dropout_rate
-
-        self.qkv_proj = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
-        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-
-    def forward(self, x, cos, sin):
-        B, T, C = x.size()
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-
-        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-
-        q, k = apply_rotary_pos_emb(q, k, cos[:T], sin[:T])
-
-        out = nn.functional.scaled_dot_product_attention(
-            q, k, v, is_causal=True, dropout_p=self.dropout_rate if self.training else 0.0
-        )
-
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(out)
-
-class RoPETransformerBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout_rate=0.1):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.attn = CausalSelfAttentionWithRoPE(hidden_size, num_heads, dropout_rate)
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.GELU(),
-            nn.Linear(hidden_size * 4, hidden_size),
-            nn.Dropout(dropout_rate)
-        )
-
-    def forward(self, x, cos, sin):
-        x = x + self.attn(self.norm1(x), cos, sin)
-        x = x + self.mlp(self.norm2(x))
-        return x
 
 class OptimizedMusicTransformer(nn.Module):
-    """Predicts next REMI tokens in sequence using RoPE attention."""
-    def __init__(self, num_tokens=384, hidden_size=768, num_layers=6, num_heads=8, seq_len=768, dropout_rate=0.15):
+    """Predicts next REMI tokens in sequence using causal self-attention."""
+    def __init__(self, num_tokens=384, hidden_size=768, num_layers=6, num_heads=8, seq_len=768, dropout_rate=0.1):
         super().__init__()
+        self.num_tokens = num_tokens
+        
+        # Single embedding layer for all 384 tokens
         self.token_embed = nn.Embedding(num_embeddings=num_tokens, embedding_dim=hidden_size)
-        self.dropout = nn.Dropout(dropout_rate)
+        self.pos_embed = nn.Embedding(num_embeddings=seq_len, embedding_dim=hidden_size)
+        self.input_norm = nn.LayerNorm(hidden_size)
         
-        self.rope = RotaryEmbedding(dim=hidden_size // num_heads, max_seq_len=seq_len)
-        self.layers = nn.ModuleList([
-            RoPETransformerBlock(hidden_size, num_heads, dropout_rate)
-            for _ in range(num_layers)
-        ])
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=hidden_size * 4,
+            dropout=dropout_rate,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        self.final_norm = nn.LayerNorm(hidden_size)
+        # Single output head mapping back to the 384-token vocabulary
         self.output_head = nn.Linear(hidden_size, num_tokens)
 
     def forward(self, token_seq):
         batch_size, seq_length = token_seq.size()
-        x = self.dropout(self.token_embed(token_seq))
         
-        cos, sin = self.rope(x, seq_length)
+        # Embed tokens and add positional encodings
+        tok_embeds = self.token_embed(token_seq)
         
-        for layer in self.layers:
-            x = layer(x, cos, sin)
-            
-        x = self.final_norm(x)
-        logits = self.output_head(x)
-        return {'pitch': logits}
+        positions = torch.arange(seq_length, device=token_seq.device).unsqueeze(0).expand(batch_size, seq_length)
+        pos_embeds = self.pos_embed(positions)
+        
+        x = tok_embeds + pos_embeds
+        x = self.input_norm(x)
+        
+        # Upper-triangular causal mask prevents position t from attending to t+1...T
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_length, device=token_seq.device)
+        transformer_out = self.transformer(x, mask=causal_mask, is_causal=True)
+        
+        # Final logits for the 384 vocabulary: (B, T, 384)
+        logits = self.output_head(transformer_out)
+        
+        return {'pitch': logits} # Kept key as 'pitch' to minimize changes in your training loop
 
 # ==========================================
 # 4. MAIN WORKER & TRAINING LOOP
 # ==========================================
+
+
 
 def main_worker(gpu, world_size, hparams):
     rank = gpu
@@ -302,9 +269,10 @@ def main_worker(gpu, world_size, hparams):
 
     if is_main_process:
         wandb_api_key = "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"
-        wandb.login(key=wandb_api_key)
-
-
+        if wandb_api_key:
+            wandb.login(key=wandb_api_key)
+        else:
+            wandb.login()
         wandb.init(
             project="music-rnn-ddp",
             entity="riya-rajbhut-student",
@@ -319,9 +287,9 @@ def main_worker(gpu, world_size, hparams):
     converted_notes = load_or_create_note_cache(dataset_root, is_main_process, hparams['years_to_use'])
     train_notes, val_notes, test_notes = split_song_arrays(converted_notes, seed=hparams['seed'])
 
-    train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], hop_length=hparams['hop_length'], augment=hparams['train_augment'])
-    val_dataset = BasicRNNForMusic(val_notes, seq_len=hparams['seq_len'], hop_length=hparams['hop_length'], augment=hparams['val_augment'])
-    test_dataset = BasicRNNForMusic(test_notes, seq_len=hparams['seq_len'], hop_length=hparams['hop_length'], augment=hparams['test_augment'])
+    train_dataset = BasicRNNForMusic(train_notes, seq_len=hparams['seq_len'], augment=True, hop_length=hparams['seq_len'])
+    val_dataset = BasicRNNForMusic(val_notes, seq_len=hparams['seq_len'], augment=False, hop_length=hparams['seq_len'])
+    test_dataset = BasicRNNForMusic(test_notes, seq_len=hparams['seq_len'], augment=False, hop_length=hparams['seq_len'])
 
     if is_main_process:
         print(f"Dataset split — Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
@@ -332,12 +300,12 @@ def main_worker(gpu, world_size, hparams):
     num_workers = min(8, max(4, (os.cpu_count() or 4) // world_size))
     train_loader = data.DataLoader(train_dataset, batch_size=hparams['batch_size_per_gpu'], sampler=train_sampler, pin_memory=True, num_workers=num_workers, drop_last=True, persistent_workers=True)
     val_loader = data.DataLoader(val_dataset, batch_size=hparams['batch_size_per_gpu'], sampler=val_sampler, pin_memory=True, num_workers=num_workers, persistent_workers=True)
+    test_loader = data.DataLoader(test_dataset, batch_size=hparams['batch_size_per_gpu'], pin_memory=True, num_workers=num_workers, shuffle=False)
 
     model = OptimizedMusicTransformer(
         hidden_size=hparams['hidden_size'], 
         num_layers=hparams['num_layers'],
-        seq_len=hparams['seq_len'],
-        dropout_rate=hparams['dropout_rate']
+        seq_len=hparams['seq_len']
     ).cuda(gpu)
     model = DDP(model, device_ids=[gpu])
 
@@ -377,26 +345,37 @@ def main_worker(gpu, world_size, hparams):
 
             with autocast("cuda"):
                 preds = model(x_pitch)
+                
+                # Flatten sequence tokens: (B, T, C) -> (B*T, C)
                 flat_y = y_pitch.reshape(-1)
                 flat_pitch_logits = preds['pitch'].reshape(-1, 384)
 
                 predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
-                train_correct_t += (predicted_pitch == flat_y).sum()
-                train_total += flat_y.size(0)
-                loss_pitch = criterion_pitch(flat_pitch_logits, flat_y)
+                if model.training:
+                    train_correct_t += (predicted_pitch == flat_y).sum()
+                    train_total += flat_y.size(0)
 
-            scaler.scale(loss_pitch).backward()
+                loss_pitch = criterion_pitch(flat_pitch_logits, flat_y)
+                
+                train_loss = loss_pitch
+
+            scaler.scale(train_loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             scaler.step(optimizer)
             scaler.update()
 
-            running_loss_t += loss_pitch.detach()
+            # .detach() only — stays on GPU, no CPU/GPU sync happens here
+
+            running_loss_t += train_loss.detach()
             running_pitch_loss_t += loss_pitch.detach()
 
+        # Single sync point for the whole epoch's training stats, instead of one per batch
         running_loss = running_loss_t.item()
         running_pitch_loss = running_pitch_loss_t.item()
         train_correct = train_correct_t.item()
+
+
 
         # Validation Loop
         model.eval()
@@ -410,16 +389,21 @@ def main_worker(gpu, world_size, hparams):
 
                 with autocast("cuda"):
                     preds = model(x_pitch)
+                    
                     flat_y = y_pitch.reshape(-1)
                     flat_pitch_logits = preds['pitch'].reshape(-1, 384)
 
                     predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
+
                     val_correct += (predicted_pitch == flat_y).sum().item()
                     val_total += flat_y.size(0)
                     
                     loss_pitch = criterion_pitch(flat_pitch_logits, flat_y)
-                    val_loss_tot += loss_pitch.item()
+                    
+                    val_loss = loss_pitch
+                    val_loss_tot += val_loss.item()
                     val_loss_p += loss_pitch.item()
+
 
         metrics = torch.tensor(
             [
@@ -451,6 +435,7 @@ def main_worker(gpu, world_size, hparams):
 
         train_acc = train_correct_all / train_total_all if train_total_all else 0.0
         val_acc = val_correct_all / val_total_all if val_total_all else 0.0
+        
 
         current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step()
@@ -477,6 +462,15 @@ def main_worker(gpu, world_size, hparams):
                 best_val_pitch_loss = val_p_l
                 epochs_without_improvement = 0
                 torch.save({"model_state_dict": model.module.state_dict()}, best_checkpoint_path)
+                
+                # --- WandB Model Artifact Logging ---
+                artifact = wandb.Artifact(
+                    name="best_model",
+                    type="model",
+                    description=f"Best model saved at epoch {epoch + 1} with val_loss {val_l:.4f}"
+                )
+                artifact.add_file(str(best_checkpoint_path))
+                wandb.log_artifact(artifact)
             else:
                 epochs_without_improvement += 1
 
@@ -485,36 +479,50 @@ def main_worker(gpu, world_size, hparams):
         if stop_signal.item() > 0:
             break
 
-    # ==========================================
+# ==========================================
     # 5. TEST EVALUATION (POST-TRAINING)
     # ==========================================
+    
+    # Ensure all GPUs wait for training to completely finish
     dist.barrier()
+    
+    # Load the best weights saved during the validation loop
+    # map_location ensures the weights are loaded safely across the correct GPUs
+    best_ckpt = torch.load(best_checkpoint_path, map_location=f'cuda:{gpu}', weights_only=True)
+    model.module.load_state_dict(best_ckpt["model_state_dict"])
     
     if is_main_process:
         print("\n=== Commencing Test Evaluation using Best Checkpoint ===")
-        best_ckpt = torch.load(best_checkpoint_path, map_location=f'cuda:{gpu}', weights_only=True)
-        model.module.load_state_dict(best_ckpt["model_state_dict"])
-        model.eval()
         
-        test_loader = data.DataLoader(test_dataset, batch_size=hparams['batch_size_per_gpu'], shuffle=False, num_workers=num_workers)
-        test_correct, test_total = 0, 0
-        
-        with torch.no_grad():
-            for x_pitch, y_pitch in test_loader:
-                x_pitch = x_pitch.cuda(gpu, non_blocking=True)
-                y_pitch = y_pitch.cuda(gpu, non_blocking=True)
+    model.eval()
+    test_correct = torch.zeros((), device=gpu, dtype=torch.float64)
+    test_total = 0
 
-                with autocast("cuda"):
-                    preds = model(x_pitch)
-                    flat_y = y_pitch.reshape(-1)
-                    flat_pitch_logits = preds['pitch'].reshape(-1, 384)
-                    predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
-                    test_correct += (predicted_pitch == flat_y).sum().item()
-                    test_total += flat_y.size(0)
+    with torch.no_grad():
+        for x_pitch, y_pitch in test_loader:
+            x_pitch = x_pitch.cuda(gpu, non_blocking=True)
+            y_pitch = y_pitch.cuda(gpu, non_blocking=True)
 
-        test_accuracy = (test_correct / test_total) if test_total > 0 else 0.0
+            with autocast("cuda"):
+                preds = model(x_pitch)
+                
+                flat_y = y_pitch.reshape(-1)
+                flat_pitch_logits = preds['pitch'].reshape(-1, 384)
+                
+                predicted_pitch = torch.argmax(flat_pitch_logits, dim=1)
+                test_correct += (predicted_pitch == flat_y).sum()
+                test_total += flat_y.size(0)
+
+    # Aggregate test results across all GPUs
+    dist.all_reduce(test_correct, op=dist.ReduceOp.SUM)
+    
+    test_accuracy = (test_correct.item() / (test_total * world_size)) if test_total > 0 else 0.0
+
+    if is_main_process:
         print(f"Final Test Accuracy: {test_accuracy * 100:.2f}%")
         wandb.log({"test/accuracy": test_accuracy})
+
+    if is_main_process:
         wandb.finish()
 
     dist.destroy_process_group()
@@ -522,24 +530,21 @@ def main_worker(gpu, world_size, hparams):
 
 if __name__ == '__main__':
     hyperparameters = {
-        'seq_len': 768,             
-        'hidden_size': 768,         
-        'num_layers': 6,            
-        'batch_size_per_gpu': 32,   
-        'epochs': 40,              
-        'patience': 20,              # Extended patience so cosine scheduler decays to 1e-5
-        'lr': 2.5e-4,                            
-        'warmup_epochs': 5,         
-        'weight_decay': 0.01,        # Increased to penalize overfitting
-        'label_smoothing': 0.05,     # Smooth cross entropy target distribution
-        'dropout_rate': 0.15,        # Added dropout for regularization
-        'seed': 53,
-        'years_to_use': None,
-        'hop_length': 256,
-        'train_augment': True,       # RE-ENABLED: Essential for REMI pitch invariance
-        'val_augment': False,
-        'test_augment': False
-    }
+            'seq_len': 768,             
+            'hidden_size': 768,         # Widen the network (BERT-base size) to learn complex patterns
+            'num_layers': 6,            
+            'batch_size_per_gpu': 32,   # Halved to prevent Out-Of-Memory errors with the larger hidden_size
+            'epochs': 120,              # Increased to let the model train until early stopping kicks in
+            'patience': 10,
+            'lr': 3e-4,                            
+            'warmup_epochs': 5,         
+            'weight_decay': 1e-4,
+            'lambda_pc': 0.0,           # Set to 0 to disable auxiliary loss and focus fully on pitch   
+            'lambda_oct': 0.0,          # Set to 0 to disable auxiliary loss and focus fully on pitch 
+            'label_smoothing': 0.0,
+            'seed': 53,
+            'years_to_use': None
+        }
     gpus_available = torch.cuda.device_count()
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
