@@ -119,7 +119,7 @@ def embedding_figure(X, title, path, n_perm=2000, seed=0):
     a.legend(loc="best", fontsize=8)
     a = ax[1, 0]
     ks = np.arange(1, 7)
-    lab = ["1\nsemitone", "2\nwhole tone", "3\nminor 3rd", "4\nmajor 3rd", "5\nfifth", "6\ntritone"]
+    lab = ["1\nsemitone\n(chromatic)", "2\ntritone\nperiod", "3\nmajor-3rd\ncycle", "4\nminor-3rd\ncycle", "5\nfifths", "6\nwhole-tone"]
     a.bar(ks, s["shares"] * 100, color="tab:blue", alpha=0.85, label="learned vectors")
     lo, hi = np.percentile(s["null_shares"], [2.5, 97.5], axis=0) * 100
     a.vlines(ks, lo, hi, color="black", lw=2, label="permutation null (95%)")

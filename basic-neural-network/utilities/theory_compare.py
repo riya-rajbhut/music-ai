@@ -363,6 +363,9 @@ def embedding_row(X, tag, n_perm, seed=53):
     row = {f"{tag}_fifths": -s["rho5"], f"{tag}_chrom": -s["rho1"], f"{tag}_p_fifths": s["p_rho5"],
            f"{tag}_p_chrom": s["p_rho1"], f"{tag}_k5": s["shares"][4] * 100, f"{tag}_k1": s["shares"][0] * 100,
            f"{tag}_p_k5": s["p_share"][4], f"{tag}_p_k1": s["p_share"][0]}
+    for k in (2, 3, 4, 6):                       # all six Fourier components (k = 1 and 5 above)
+        row[f"{tag}_k{k}"] = s["shares"][k - 1] * 100
+        row[f"{tag}_p_k{k}"] = s["p_share"][k - 1]
     return row, s["C"], U[:, :2] * S[:2]
 
 
