@@ -267,7 +267,8 @@ def make_dataset(key, mod, data_root):
 
 
 def batches(key, m, ds, dev, max_windows, bs, seed=0):
-    """yields ctx (B,K) pitch classes of the context, probs (B,N,128) over pitches, tgt (B,N) true pitches"""
+    """yields ctx (B,K) pitch classes of the context, probs (B,N,128) over pitches, tgt (B,N) true pitches,
+    seq (B,L) pitch classes of the window and off: the notes before scored note n are seq[:, off+n-8 : off+n]"""
     import torch
     import torch.utils.data as data
     rng = np.random.default_rng(seed)
@@ -279,18 +280,21 @@ def batches(key, m, ds, dev, max_windows, bs, seed=0):
                 x, y = b
                 x, y = x.to(dev), y.to(dev)
                 logits = m(x)["pitch"]                                                  # (B,128)
-                yield (x % 12).cpu().numpy(), torch.softmax(logits.float(), -1)[:, None], y[:, None]
+                yield ((x % 12).cpu().numpy(), torch.softmax(logits.float(), -1)[:, None], y[:, None],
+                       (x % 12).cpu().numpy(), x.shape[1])
             elif key == "gru":
                 (x, t), (y, _) = b
                 x, t, y = x.to(dev), t.to(dev), y.to(dev)
                 logits = m(x, t)["pitch"]
-                yield (x % 12).cpu().numpy(), torch.softmax(logits.float(), -1)[:, None], y[:, None]
+                yield ((x % 12).cpu().numpy(), torch.softmax(logits.float(), -1)[:, None], y[:, None],
+                       (x % 12).cpu().numpy(), x.shape[1])
             elif key == "tf6":
                 x, y = b
                 x, y = x.to(dev), y.to(dev)
                 logits = m(x)["pitch"]                                                  # (B,T,128)
                 h = x.shape[1] // 2
-                yield (x[:, :h] % 12).cpu().numpy(), torch.softmax(logits[:, h:].float(), -1), y[:, h:]
+                yield ((x[:, :h] % 12).cpu().numpy(), torch.softmax(logits[:, h:].float(), -1), y[:, h:],
+                       (x % 12).cpu().numpy(), h + 1)                         # y[:, h] = x[:, h + 1]
             else:                                                                        # REMI family: 3 tokens per note
                 if key in ("remi12", "remi6"):
                     x, y = b
@@ -307,15 +311,52 @@ def batches(key, m, ds, dev, max_windows, bs, seed=0):
                 probs = torch.softmax(logits[:, 0::3, :128].float(), -1)[:, N0:]         # grammar: pitch only
                 tgt = y[:, 0::3][:, N0:]
                 ctx = (x[:, 1::3][:, :N0] % 12).cpu().numpy()
-                yield ctx, probs, tgt
+                yield ctx, probs, tgt, (x[:, 1::3] % 12).cpu().numpy(), N0
 
 
 def new_stats():
     return dict(rel_pred=np.zeros((2, 12)), rel_true=np.zeros((2, 12)), rel_notes=np.zeros(2), rel_windows=np.zeros(2, int),
-                err_int=np.zeros(12), err_true_pc=np.zeros(12), err_pred_pc=np.zeros(12), n_notes=0, n_correct=0)
+                err_int=np.zeros(12), err_true_pc=np.zeros(12), err_pred_pc=np.zeros(12), n_notes=0, n_correct=0,
+                ic_obs=[], ic_ctx=[], ic_rec=[])                    # per-window interval-class counts (see error_baselines)
 
 
-def accumulate(st, ctx, probs, tgt, min_corr):
+IC = np.array([min(i, 12 - i) for i in range(12)])                   # interval (mod 12) -> interval class 0..6
+RECENT = 8                                                           # notes in the "recent notes" baseline
+
+
+def error_baselines(st, ctx, tgt, pred, wrong, seq, off):
+    """Wrong guesses whose pitch class differs from the true one, by interval class 1..6 (both directions merged),
+    against two data baselines: a guess drawn from the pitch classes of the context window (key-level statistics)
+    or of the RECENT notes before the scored note (local melody and chords). Baselines exclude the true pitch class
+    and are renormalised per note; notes whose baseline would be empty are dropped from all three. Per-window sums
+    are kept so that key_row can bootstrap over windows."""
+    t = (tgt % 12).cpu().numpy()
+    g = (pred % 12).cpu().numpy()
+    use = wrong.cpu().numpy() & (g != t)                                              # (B,N)
+    B, N = t.shape
+    roll = (t[..., None] + np.arange(12)) % 12                                        # pitch class at interval i above truth
+    Hc = np.stack([np.bincount(r, minlength=12) for r in ctx]).astype(float)          # (B,12)
+    base_c = np.take_along_axis(np.repeat(Hc[:, None], N, 1), roll, 2)                # (B,N,12) by interval
+    oh = np.eye(12)[seq]                                                              # (B,L,12)
+    cs = np.concatenate([np.zeros((B, 1, 12)), oh.cumsum(1)], 1)
+    idx = off + np.arange(N)
+    Hr = cs[:, idx] - cs[:, idx - RECENT]                                             # (B,N,12) last RECENT notes
+    base_r = np.take_along_axis(Hr, roll, 2)
+    out = []
+    for base in (base_c, base_r):
+        base[..., 0] = 0.0                                                            # a different pitch class only
+        out.append(base)
+    tot_c, tot_r = out[0].sum(-1), out[1].sum(-1)
+    use &= (tot_c > 0) & (tot_r > 0)
+    fold = np.zeros((12, 7)); fold[np.arange(12), IC] = 1.0
+    obs = np.zeros((B, N, 12)); np.put_along_axis(obs, ((g - t) % 12)[..., None], 1.0, 2)
+    m = use[..., None]
+    st["ic_obs"].append(((obs * m).sum(1)) @ fold)
+    st["ic_ctx"].append(((out[0] / np.maximum(tot_c, 1e-12)[..., None] * m).sum(1)) @ fold)
+    st["ic_rec"].append(((out[1] / np.maximum(tot_r, 1e-12)[..., None] * m).sum(1)) @ fold)
+
+
+def accumulate(st, ctx, probs, tgt, min_corr, seq, off):
     import torch
     tp = _tp()
     B, N, _ = probs.shape
@@ -327,6 +368,7 @@ def accumulate(st, ctx, probs, tgt, min_corr):
     st["err_int"] += np.bincount(((pred % 12 - tgt % 12) % 12)[wrong].cpu().numpy(), minlength=12)
     st["err_true_pc"] += np.bincount((tgt % 12)[wrong].cpu().numpy(), minlength=12)
     st["err_pred_pc"] += np.bincount((pred % 12)[wrong].cpu().numpy(), minlength=12)
+    error_baselines(st, ctx, tgt, pred, wrong, seq, off)
     hist = np.stack([np.bincount(r, minlength=12) for r in ctx])
     tonic, mode, corr = tp.estimate_keys(hist)
     keep = corr >= min_corr
@@ -388,6 +430,23 @@ def key_row(st):
     out["err_fifths1_exp"] = sum(exp[i] for i in range(12) if tp.d5_of_interval(i) == 1) * 100
     out["pitch_acc_%"] = 100 * st["n_correct"] / max(st["n_notes"], 1)
     out["n_scored_notes"] = int(st["n_notes"])
+    for i in range(12):                                                                   # all intervals, original baseline
+        out[f"err_i{i}_obs"], out[f"err_i{i}_exp"] = obs[i] * 100, exp[i] * 100
+    if st["ic_obs"]:
+        O, C, R = (np.concatenate(st[k]) for k in ("ic_obs", "ic_ctx", "ic_rec"))       # (windows, 7)
+        n = O.sum()
+        out["err_n_other_pc"] = int(n)
+        rng = np.random.default_rng(53)
+        boot = rng.integers(0, len(O), size=(2000, len(O)))
+        so, sc, sr = (100 * A.sum(0) / max(n, 1e-12) for A in (O, C, R))
+        bo = np.stack([100 * O[b].sum(0) / O[b].sum() for b in boot])
+        bc = np.stack([100 * C[b].sum(0) / O[b].sum() for b in boot])
+        br = np.stack([100 * R[b].sum(0) / O[b].sum() for b in boot])
+        for ic in range(1, 7):
+            out[f"err_ic{ic}_obs"], out[f"err_ic{ic}_ctx"], out[f"err_ic{ic}_rec"] = so[ic], sc[ic], sr[ic]
+            for tag, bb in (("ctx", bc), ("rec", br)):
+                lo, hi = np.percentile(bo[:, ic] - bb[:, ic], [2.5, 97.5])
+                out[f"err_ic{ic}_d{tag}_lo"], out[f"err_ic{ic}_d{tag}_hi"] = lo, hi
     return out
 
 
@@ -642,8 +701,8 @@ def main():
                                                   "(glob order); use the original .pkl cache if you still have it" if rebuilt else ""),
                           flush=True)
                     st = new_stats()
-                    for ctx, probs, tgt in batches(key, m, ds, dev, args.max_windows, args.batch):
-                        accumulate(st, ctx, probs, tgt, args.min_corr)
+                    for ctx, probs, tgt, seq, off in batches(key, m, ds, dev, args.max_windows, args.batch):
+                        accumulate(st, ctx, probs, tgt, args.min_corr, seq, off)
                     row.update(key_row(st))
                     row["test_windows_training_hop"] = ref
                     row["cache_rebuilt"] = rebuilt
