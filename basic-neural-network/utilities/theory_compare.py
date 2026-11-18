@@ -681,6 +681,8 @@ def main():
             print(f"  {label}: {cfg}", flush=True)
             row = dict(model=key, label=label, untrained=not trained, config=str(cfg))
             V = pitch_vectors(key, m)
+            if trained: 
+                np.save(os.path.join(args.out_dir, f"{key}_out_vectors.npy"), octave_mean(V["out"]))
             r, C, xy = embedding_row(octave_mean(V["out"]), "out", args.n_perm)
             row.update(r)
             if trained:
